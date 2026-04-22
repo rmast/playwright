@@ -61,6 +61,12 @@ const kCSSIdScore = 500;
 const kRoleWithoutNameScore = 510;
 const kCSSInputTypeNameScore = 520;
 const kCSSTagNameScore = 530;
+
+// Row-context selectors (table row + cell content) score better than nth but worse than CSS ID.
+// This enables semantic selection in tree tables and data grids.
+const kTableRowContextScore = 650;
+const kTableRowTextContextScore = 700;
+
 const kNthScore = 10000;
 const kCSSFallbackScore = 10000000;
 
@@ -164,6 +170,13 @@ function generateSelectorFor(cache: Cache, injectedScript: InjectedScript, targe
     for (const candidate of buildTextCandidates(injectedScript, targetElement, !options.isRecursive))
       candidates.push({ candidate, isTextCandidate: true });
   }
+  
+  // Add row-context candidates for elements within table rows (Vaadin, data grids, etc.)
+  if (!options.isRecursive && isElementInTableRow(targetElement)) {
+    for (const candidate of buildTableRowContextCandidates(injectedScript, targetElement))
+      candidates.push({ candidate, isTextCandidate: true });
+  }
+  
   for (const token of buildNoTextCandidates(injectedScript, targetElement, options)) {
     if (options.omitInternalEngines && token.engine.startsWith('internal:'))
       continue;
@@ -579,3 +592,117 @@ function cssEscapeCharacter(s: string, i: number): string {
     return s.charAt(i);
   return '\\' + s.charAt(i);
 }
+
+// ============ Table Row Context Selectors (Vaadin Tree Tables & Data Grids) ============
+// These helpers enable semantic row-based selection in structured tables where pure nth()
+// would be fragile. Common in Vaadin applications with tree tables and complex row layouts.
+
+function isElementInTableRow(element: Element): boolean {
+  // Check if element or any ancestor is a <tr> or has role="row"
+  return !!element.closest('tr, [role="row"]');
+}
+
+function getTableRowAncestor(element: Element): Element | null {
+  return element.closest('tr, [role="row"]');
+}
+
+function extractRowIdentifier(row: Element): string | null {
+  // Try to extract a unique identifier from the row (ID or meaningful text from first cell).
+  // Strategy:
+  // 1. Check if row itself or first <td>/<th> has an ID.
+  // 2. Extract text from first <td> (up to 80 chars, numbers + short words).
+  // 3. Return null if no suitable identifier found.
+  
+  if (row.id && !isGuidLike(row.id))
+    return row.id;
+
+  const firstCell = row.querySelector('td, th, [role="cell"]');
+  if (!firstCell)
+    return null;
+
+  if (firstCell.id && !isGuidLike(firstCell.id))
+    return firstCell.id;
+
+  // Extract short text from first cell (prefer codes/IDs over long descriptions)
+  const labels = firstCell.querySelectorAll('[id], .v-label');
+  for (const lbl of Array.from(labels)) {
+    if (lbl.id && !isGuidLike(lbl.id) && lbl.textContent && lbl.textContent.trim().length < 20)
+      return lbl.id;
+  }
+
+  // Fallback to first cell text (trimmed to 80 chars and cleaned)
+  const text = firstCell.textContent?.trim() || '';
+  if (text) {
+    const shortText = trimWordBoundary(text, 80);
+    // Prefer short identifiers (likely codes) over long text
+    const words = shortText.split(/\s+/);
+    if (words[0] && words[0].length < 20 && /^[a-zA-Z0-9_-]+$/.test(words[0]))
+      return words[0];
+    if (shortText.length < 60)
+      return shortText;
+  }
+
+  return null;
+}
+
+function buildTableRowContextCandidates(injectedScript: InjectedScript, element: Element): SelectorToken[][] {
+  // Generate row-context-aware selectors for elements within table rows.
+  // Returns empty array if element is not in a row or row has no suitable identifier.
+  const candidates: SelectorToken[][] = [];
+  
+  const row = getTableRowAncestor(element);
+  if (!row)
+    return candidates;
+
+  const rowId = extractRowIdentifier(row);
+  if (!rowId)
+    return candidates;
+
+  // Strategy 1: Use row ID + target element selector
+  // E.g., 'tr[id="row-1"] >> button.delete'
+  if (row.id && !isGuidLike(row.id)) {
+    const targetSelector = buildSimpleSelector(element);
+    if (targetSelector) {
+      candidates.push([
+        { engine: 'css', selector: `tr#${row.id}`, score: kTableRowContextScore },
+        { engine: 'css', selector: targetSelector, score: kCSSTagNameScore }
+      ]);
+    }
+  }
+
+  // Strategy 2: Use row text context + target element
+  // E.g., 'tr >> has-text="Activity Code" >> button.select'
+  if (rowId) {
+    const targetSelector = buildSimpleSelector(element);
+    if (targetSelector) {
+      candidates.push([
+        { engine: 'css', selector: 'tr', score: kTableRowContextScore },
+        { engine: 'internal:has-text', selector: escapeForTextSelector(rowId, true), score: kTableRowTextContextScore },
+        { engine: 'css', selector: targetSelector, score: kCSSTagNameScore }
+      ]);
+    }
+  }
+
+  return candidates;
+}
+
+function buildSimpleSelector(element: Element): string | null {
+  // Build a simple single-level selector for an element (no nth, no parent navigation).
+  // Used for combining with row context selectors.
+  if (element.id && !isGuidLike(element.id))
+    return `#${element.id}`;
+  
+  const classes = [...element.classList].filter(c => !c.startsWith('v-') && c.length > 1);
+  if (classes.length) {
+    const classSelector = '.' + classes.slice(0, 2).join('.');
+    return classSelector;
+  }
+  
+  const tag = escapeNodeName(element);
+  if (element.nodeName === 'BUTTON' || element.nodeName === 'A' || element.nodeName === 'INPUT')
+    return tag;
+  
+  return null;
+}
+
+// ============ End Table Row Context ============
