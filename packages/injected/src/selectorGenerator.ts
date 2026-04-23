@@ -634,7 +634,10 @@ function extractRowIdentifier(row: Element): string | null {
   const text = firstCell.textContent?.trim() || '';
   if (text) {
     const shortText = trimWordBoundary(text, 80);
-    // Prefer short identifiers (likely codes) over long text
+    // Prefer full readable row text when available so generated selector stays intuitive.
+    if (shortText.includes(' ') && shortText.length < 80)
+      return shortText;
+    // Fall back to compact identifiers (likely codes).
     const words = shortText.split(/\s+/);
     if (words[0] && words[0].length < 20 && /^[a-zA-Z0-9_-]+$/.test(words[0]))
       return words[0];
@@ -677,7 +680,7 @@ function buildTableRowContextCandidates(injectedScript: InjectedScript, element:
     if (targetSelector) {
       candidates.push([
         { engine: 'css', selector: 'tr', score: kTableRowContextScore },
-        { engine: 'internal:has-text', selector: escapeForTextSelector(rowId, true), score: kTableRowTextContextScore },
+        { engine: 'internal:has-text', selector: escapeForTextSelector(rowId, false), score: kTableRowTextContextScore },
         { engine: 'css', selector: targetSelector, score: kCSSTagNameScore }
       ]);
     }
@@ -697,6 +700,21 @@ function buildSimpleSelector(element: Element): string | null {
     const classSelector = '.' + classes.slice(0, 2).join('.');
     return classSelector;
   }
+
+  // If there are only v-* classes, still pick meaningful non-generic ones.
+  const specificVClasses = [...element.classList].filter(c =>
+    c.startsWith('v-')
+    && c !== 'v-widget'
+    && c !== 'v-nativebutton'
+    && c !== 'v-disabled'
+    && c !== 'v-has-width'
+  );
+  if (specificVClasses.length)
+    return `${escapeNodeName(element)}.${specificVClasses.slice(0, 2).join('.')}`;
+
+  // Vaadin tree table twistee uses only v-* classes, keep the stable class for better locators.
+  if (element.classList.contains('v-treetable-treespacer'))
+    return 'span.v-treetable-treespacer';
   
   const tag = escapeNodeName(element);
   if (element.nodeName === 'BUTTON' || element.nodeName === 'A' || element.nodeName === 'INPUT')

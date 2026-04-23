@@ -138,6 +138,77 @@ it.describe('selector generator', () => {
     expect(await generate(page, 'div[mark="1"]')).toBe(`internal:text="Text"i >> nth=2`);
   });
 
+  it('should generate vaadin twistee locator using row text context', async ({ page }) => {
+    await page.setContent(`
+      <table>
+        <tr class="v-table-row">
+          <td class="v-table-cell-content">
+            <div class="v-table-cell-wrapper" style="padding-left: 18px;">
+              <span class="v-treetable-treespacer v-treetable-node-open" style="width: 18px;"></span>
+              <div class="v-csslayout v-layout v-widget activiteit-categorie v-csslayout-activiteit-categorie">
+                <div class="v-label v-widget cat v-label-cat v-has-width" style="width: 100%;">Andere sensorische functies</div>
+              </div>
+            </div>
+          </td>
+        </tr>
+        <tr class="v-table-row">
+          <td class="v-table-cell-content">
+            <div class="v-table-cell-wrapper" style="padding-left: 18px;">
+              <span class="v-treetable-treespacer v-treetable-node-open" style="width: 18px;"></span>
+              <div class="v-csslayout v-layout v-widget activiteit-categorie v-csslayout-activiteit-categorie">
+                <div class="v-label v-widget cat v-label-cat v-has-width" style="width: 100%;">Overige mentale functies</div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      </table>
+    `);
+    const selector = await generate(page, 'tr:first-child .v-treetable-treespacer');
+    expect(selector).toMatch(/Andere sensorische functies/);
+    expect(selector).toMatch(/internal:has-text|internal:role=cell\[name=/);
+    expect(selector).toMatch(/span|v-treetable-treespacer/);
+    expect(selector).not.toContain('nth=');
+  });
+
+  it('should generate vaadin row-scoped locator for sibling icon buttons', async ({ page }) => {
+    await page.setContent(`
+      <table>
+        <tr class="v-table-row">
+          <td class="v-table-cell-content">
+            <div class="v-table-cell-wrapper">
+              <div class="v-label v-widget">b2300</div>
+              <div class="v-label v-widget">Detectie van geluid</div>
+            </div>
+          </td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget itje"><span class="v-nativebutton-caption"></span></button></div></td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget item-selectie" id="b2300"><span class="v-nativebutton-caption"></span></button></div></td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget gerelateerd-icon"><span class="v-nativebutton-caption"></span></button></div></td>
+        </tr>
+        <tr class="v-table-row">
+          <td class="v-table-cell-content">
+            <div class="v-table-cell-wrapper">
+              <div class="v-label v-widget">b2301</div>
+              <div class="v-label v-widget">Discriminatie van geluid</div>
+            </div>
+          </td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget itje"><span class="v-nativebutton-caption"></span></button></div></td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget item-selectie" id="b2301"><span class="v-nativebutton-caption"></span></button></div></td>
+          <td class="v-table-cell-content"><div class="v-table-cell-wrapper"><button class="v-nativebutton v-widget gerelateerd-icon"><span class="v-nativebutton-caption"></span></button></div></td>
+        </tr>
+      </table>
+    `);
+
+    const leftSelector = await generate(page, 'tr:first-child button.itje');
+    expect(leftSelector).toMatch(/b2300|Detectie van geluid/);
+    expect(leftSelector).toMatch(/itje|role=cell\[name=/);
+    expect(leftSelector).not.toMatch(/nth=\d+$/);
+
+    const rightSelector = await generate(page, 'tr:first-child button.gerelateerd-icon');
+    expect(rightSelector).toMatch(/b2300|Detectie van geluid/);
+    expect(rightSelector).toMatch(/gerelateerd-icon|role=cell\[name=/);
+    expect(rightSelector).not.toMatch(/nth=\d+$/);
+  });
+
   it('should prefer data-testid', async ({ page }) => {
     await page.setContent(`<div>Text</div><div>Text</div><div data-testid=a>Text</div><div>Text</div>`);
     expect(await generate(page, '[data-testid="a"]')).toBe('internal:testid=[data-testid=\"a\"s]');
