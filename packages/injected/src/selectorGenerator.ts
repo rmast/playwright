@@ -217,6 +217,11 @@ function generateSelectorFor(cache: Cache, injectedScript: InjectedScript, targe
       continue;
     }
 
+    // Skip nested selection for Vaadin popup menu items to avoid label-based parent locators.
+    if (targetElement.closest('.v-menubar-popup')) {
+      continue;
+    }
+
     // Now try nested selectors: (best selector for parent) >>> (this candidate selector).
     for (let parent = parentElementOrShadowHost(targetElement); parent && parent !== options.root; parent = parentElementOrShadowHost(parent)) {
       const filtered = elements.filter(e => isInsideScope(parent, e) && e !== parent);
@@ -296,12 +301,18 @@ function buildNoTextCandidates(injectedScript: InjectedScript, element: Element,
     }
   }
 
-  const labels = getElementLabels(injectedScript._evaluator._cacheText, element);
-  for (const label of labels) {
-    const labelText = label.normalized;
-    candidates.push({ engine: 'internal:label', selector: escapeForTextSelector(labelText, true), score: kLabelScoreExact });
-    for (const alternative of suitableTextAlternatives(labelText))
-      candidates.push({ engine: 'internal:label', selector: escapeForTextSelector(alternative.text, false), score: kLabelScore - alternative.scoreBonus });
+  // Vaadin popup menu items can expose generic accessibility labels like
+  // "This content is announced" on ancestors, which leads to brittle
+  // label-chained locators for submenu entries.
+  const shouldUseLabelCandidates = !element.closest('.v-menubar-popup');
+  if (shouldUseLabelCandidates) {
+    const labels = getElementLabels(injectedScript._evaluator._cacheText, element);
+    for (const label of labels) {
+      const labelText = label.normalized;
+      candidates.push({ engine: 'internal:label', selector: escapeForTextSelector(labelText, true), score: kLabelScoreExact });
+      for (const alternative of suitableTextAlternatives(labelText))
+        candidates.push({ engine: 'internal:label', selector: escapeForTextSelector(alternative.text, false), score: kLabelScore - alternative.scoreBonus });
+    }
   }
 
   const ariaRole = getAriaRole(element);
@@ -358,6 +369,17 @@ function buildTextCandidates(injectedScript: InjectedScript, element: Element, i
       // Do not use regex for parent elements (for performance).
       const re = new RegExp('^' + escapeRegExp(text) + '$');
       candidates.push([cssToken, { engine: 'internal:has-text', selector: escapeForTextSelector(re, false), score: kTextScoreRegex }]);
+    }
+
+    // For Vaadin popup menu items, include popup class context to disambiguate from other elements with same text.
+    if (element.closest('.v-menubar-popup') && element.closest('.v-menubar-menuitem-caption')) {
+      const popupCssToken: SelectorToken = { engine: 'css', selector: '.v-menubar-menuitem-caption', score: kCSSTagNameScore - 5 };
+      for (const alternative of textAlternatives)
+        candidates.push([popupCssToken, { engine: 'internal:has-text', selector: escapeForTextSelector(alternative.text, false), score: kTextScore - alternative.scoreBonus }]);
+      if (isTargetNode && text.length <= 80) {
+        const re = new RegExp('^' + escapeRegExp(text) + '$');
+        candidates.push([popupCssToken, { engine: 'internal:has-text', selector: escapeForTextSelector(re, false), score: kTextScoreRegex }]);
+      }
     }
   }
 
@@ -736,6 +758,11 @@ function buildMenubarContextCandidates(injectedScript: InjectedScript, element: 
 
   const menuItem = element.closest('.v-menubar-menuitem');
   if (!menuItem)
+    return candidates;
+
+  // Skip context-based candidates for items in popup submenus.
+  // Popup submenu items should use simple text-based selectors instead.
+  if (menuItem.closest('.v-menubar-popup'))
     return candidates;
 
   const menuText = extractMenubarText(injectedScript, menuItem);

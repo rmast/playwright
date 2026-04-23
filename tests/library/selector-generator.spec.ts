@@ -234,6 +234,31 @@ it.describe('selector generator', () => {
     expect(selector).not.toBe('internal:role=img');
   });
 
+  it('should generate simple text selector for popup submenu items without menubar context', async ({ page }) => {
+    await page.setContent(`
+      <div class="v-menubar-popup" style="position: absolute;">
+        <div class="popupContent">
+          <div class="v-menubar-submenu">
+            <span class="v-menubar-menuitem v-menubar-menuitem-navigation-menu-sub">
+              <span class="v-menubar-menuitem-caption">MOI Basic</span>
+            </span>
+            <span class="v-menubar-menuitem v-menubar-menuitem-navigation-menu-sub">
+              <span class="v-menubar-menuitem-caption">Over deze applicatie</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    `);
+
+    // Target the text node inside the popup submenu item
+    const selector = await generate(page, '.v-menubar-submenu .v-menubar-menuitem-caption');
+    // Popup submenu items should use simple text-based selectors, not menubar context
+    // that would result in invalid compound selectors.
+    expect(selector).not.toMatch(/v-menubar-menuitem.*v-menubar-menuitem/);
+    expect(selector).not.toMatch(/internal:label/);
+    expect(selector).not.toMatch(/>>/);
+  });
+
   it('should prefer data-testid', async ({ page }) => {
     await page.setContent(`<div>Text</div><div>Text</div><div data-testid=a>Text</div><div>Text</div>`);
     expect(await generate(page, '[data-testid="a"]')).toBe('internal:testid=[data-testid=\"a\"s]');
