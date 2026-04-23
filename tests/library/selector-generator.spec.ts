@@ -209,6 +209,31 @@ it.describe('selector generator', () => {
     expect(rightSelector).not.toMatch(/nth=\d+$/);
   });
 
+  it('should generate vaadin menubar icon locator using menu text context', async ({ page }) => {
+    await page.setContent(`
+      <div>
+        <span class="v-menubar-menuitem v-menubar-menuitem-username v-menubar-menuitem-selected">
+          <span class="v-menubar-submenu-indicator">►</span>
+          <span class="v-menubar-menuitem-caption">
+            <img class="v-icon" src="/VAADIN/themes/uwvtheme/images/chevron.png">VA
+          </span>
+        </span>
+        <span class="v-menubar-menuitem v-menubar-menuitem-username">
+          <span class="v-menubar-submenu-indicator">►</span>
+          <span class="v-menubar-menuitem-caption">
+            <img class="v-icon" src="/VAADIN/themes/uwvtheme/images/chevron.png">VB
+          </span>
+        </span>
+      </div>
+    `);
+
+    const selector = await generate(page, '.v-menubar-menuitem-selected img.v-icon');
+    expect(selector).toMatch(/VA/);
+    expect(selector).toMatch(/v-menubar-menuitem|internal:has-text/);
+    expect(selector).toMatch(/img|chevron|v-icon/);
+    expect(selector).not.toBe('internal:role=img');
+  });
+
   it('should prefer data-testid', async ({ page }) => {
     await page.setContent(`<div>Text</div><div>Text</div><div data-testid=a>Text</div><div>Text</div>`);
     expect(await generate(page, '[data-testid="a"]')).toBe('internal:testid=[data-testid=\"a\"s]');

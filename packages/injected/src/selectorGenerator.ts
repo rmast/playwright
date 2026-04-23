@@ -66,6 +66,9 @@ const kCSSTagNameScore = 530;
 // This enables semantic selection in tree tables and data grids.
 const kTableRowContextScore = 650;
 const kTableRowTextContextScore = 700;
+const kMenubarContextScore = 60;
+const kMenubarTextContextScore = 70;
+const kMenubarTargetScore = 80;
 
 const kNthScore = 10000;
 const kCSSFallbackScore = 10000000;
@@ -168,6 +171,11 @@ function generateSelectorFor(cache: Cache, injectedScript: InjectedScript, targe
   const candidates: { candidate: SelectorToken[], isTextCandidate: boolean }[] = [];
   if (!options.noText) {
     for (const candidate of buildTextCandidates(injectedScript, targetElement, !options.isRecursive))
+      candidates.push({ candidate, isTextCandidate: true });
+  }
+
+  if (!options.isRecursive) {
+    for (const candidate of buildMenubarContextCandidates(injectedScript, targetElement))
       candidates.push({ candidate, isTextCandidate: true });
   }
   
@@ -721,6 +729,61 @@ function buildSimpleSelector(element: Element): string | null {
     return tag;
   
   return null;
+}
+
+function buildMenubarContextCandidates(injectedScript: InjectedScript, element: Element): SelectorToken[][] {
+  const candidates: SelectorToken[][] = [];
+
+  const menuItem = element.closest('.v-menubar-menuitem');
+  if (!menuItem)
+    return candidates;
+
+  const menuText = extractMenubarText(injectedScript, menuItem);
+  if (!menuText)
+    return candidates;
+
+  const targetSelector = buildMenubarTargetSelector(element);
+  if (!targetSelector)
+    return candidates;
+
+  const classes = [...menuItem.classList].filter(c => c.startsWith('v-menubar-menuitem'));
+  const parentSelector = classes.length ? `${escapeNodeName(menuItem)}.${classes.slice(0, 2).join('.')}` : '.v-menubar-menuitem';
+
+  candidates.push([
+    { engine: 'css', selector: parentSelector, score: kMenubarContextScore },
+    { engine: 'internal:has-text', selector: escapeForTextSelector(menuText, false), score: kMenubarTextContextScore },
+    { engine: 'css', selector: targetSelector, score: kMenubarTargetScore }
+  ]);
+
+  return candidates;
+}
+
+function extractMenubarText(injectedScript: InjectedScript, menuItem: Element): string | null {
+  const rawText = elementText(injectedScript._evaluator._cacheText, menuItem).normalized;
+  if (!rawText)
+    return null;
+
+  const cleaned = rawText.replace(/[^\p{L}\p{N}\s_-]+/gu, ' ').trim().replace(/\s+/g, ' ');
+  if (cleaned.length >= 2)
+    return trimWordBoundary(cleaned, 40);
+
+  return null;
+}
+
+function buildMenubarTargetSelector(element: Element): string | null {
+  if (element.classList.contains('v-menubar-submenu-indicator'))
+    return 'span.v-menubar-submenu-indicator';
+
+  if (element.nodeName === 'IMG') {
+    const src = element.getAttribute('src') || '';
+    const last = src.split('/').pop() || '';
+    const fileName = last.split('?')[0];
+    const stem = fileName.replace(/\.[^.]+$/, '');
+    if (stem && /^[a-zA-Z0-9_-]+$/.test(stem))
+      return `img[src*=${quoteCSSAttributeValue(stem)}]`;
+  }
+
+  return buildSimpleSelector(element);
 }
 
 // ============ End Table Row Context ============
