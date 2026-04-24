@@ -58,6 +58,7 @@ const kTitleScoreExact = kTitleScore + kExactPenalty;
 const kEndPenalizedScore = 300;
 
 const kCSSIdScore = 500;
+const kCSSClassScore = 505;
 const kRoleWithoutNameScore = 510;
 const kCSSInputTypeNameScore = 520;
 const kCSSTagNameScore = 530;
@@ -270,6 +271,10 @@ function buildNoTextCandidates(injectedScript: InjectedScript, element: Element,
       if (idAttr && !isGuidLike(idAttr))
         candidates.push({ engine: 'css', selector: makeSelectorForId(idAttr), score: kCSSIdScore });
     }
+
+    const classCandidates = buildClassSelectorCandidates(element);
+    for (let i = 0; i < classCandidates.length; i++)
+      candidates.push({ engine: 'css', selector: classCandidates[i], score: kCSSClassScore + i });
 
     candidates.push({ engine: 'css', selector: escapeNodeName(element), score: kCSSTagNameScore });
   }
@@ -605,6 +610,33 @@ function escapeClassName(className: string): string {
   for (let i = 0; i < className.length; i++)
     result += cssEscapeCharacter(className, i);
   return result;
+}
+
+function isStableSelectorClass(className: string): boolean {
+  if (!className || className.length < 3)
+    return false;
+  if (className.startsWith('v-'))
+    return false;
+  if (isGuidLike(className))
+    return false;
+  if (/^[\d_-]+$/.test(className))
+    return false;
+  return true;
+}
+
+function buildClassSelectorCandidates(element: Element): string[] {
+  const classes = [...element.classList].filter(isStableSelectorClass).slice(0, 2).map(escapeClassName);
+  if (!classes.length)
+    return [];
+
+  const tag = escapeNodeName(element);
+  const candidates: string[] = [`.${classes[0]}`, `${tag}.${classes[0]}`];
+  if (classes.length > 1) {
+    const combo = `.${classes[0]}.${classes[1]}`;
+    candidates.push(combo, `${tag}${combo}`);
+  }
+
+  return [...new Set(candidates)];
 }
 
 function cssEscapeCharacter(s: string, i: number): string {
