@@ -4,6 +4,17 @@
 # Activate the recorder venv
 & ".\.venv-recorder\Scripts\Activate.ps1"
 
+# Keep tracked converter source in sync with the installed recorder package.
+$converterSrc = Resolve-Path ".\playwright_to_robot.py"
+$converterTargets = @(
+	".\.venv-recorder\Lib\site-packages\robotframework_browser_recorder\converter\playwright_to_robot.py"
+)
+foreach ($target in $converterTargets) {
+	if (Test-Path $target) {
+		Copy-Item -Path $converterSrc -Destination $target -Force
+	}
+}
+
 # Keep recorder runtimes in sync with local selector-generator build.
 $src = Resolve-Path ".\packages\playwright-core\lib\generated\injectedScriptSource.js"
 $targets = @(
