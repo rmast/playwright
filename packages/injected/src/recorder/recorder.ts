@@ -454,7 +454,7 @@ class RecordActionTool implements RecorderTool {
       this._recordAction({
         name: 'select',
         selector: this._activeModel!.selector,
-        options: [...selectElement.selectedOptions].map(option => option.value),
+        options: [...selectElement.selectedOptions].map(option => readableOptionValue(option)),
         signals: []
       });
     }
@@ -851,7 +851,7 @@ class JsonRecordActionTool implements RecorderTool {
         selector,
         ref,
         ariaSnapshot,
-        options: [...selectElement.selectedOptions].map(option => option.value),
+        options: [...selectElement.selectedOptions].map(option => readableOptionValue(option)),
         signals: []
       });
       return;
@@ -1878,6 +1878,11 @@ function asCheckbox(node: Node | null): HTMLInputElement | null {
     return null;
   const inputElement = node as HTMLInputElement;
   return ['checkbox', 'radio'].includes(inputElement.type) ? inputElement : null;
+}
+
+function readableOptionValue(option: HTMLOptionElement): string {
+  const label = option.label.trim() || option.text.trim();
+  return label || option.value;
 }
 
 function isRangeInput(node: Node | null): node is HTMLInputElement {

@@ -18,3 +18,4 @@ foreach ($target in $targets) {
 
 # Run rfbrowser-record with custom Playwright
 & rfbrowser-record @args
+

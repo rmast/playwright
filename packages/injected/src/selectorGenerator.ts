@@ -70,6 +70,9 @@ const kTableRowTextContextScore = 700;
 const kMenubarContextScore = 60;
 const kMenubarTextContextScore = 70;
 const kMenubarTargetScore = 80;
+const kSelectContextScore = 55;
+const kSelectContextTextScore = 65;
+const kSelectContextTargetScore = 75;
 
 const kNthScore = 10000;
 const kCSSFallbackScore = 10000000;
@@ -177,6 +180,11 @@ function generateSelectorFor(cache: Cache, injectedScript: InjectedScript, targe
 
   if (!options.isRecursive) {
     for (const candidate of buildMenubarContextCandidates(injectedScript, targetElement))
+      candidates.push({ candidate, isTextCandidate: true });
+  }
+
+  if (!options.isRecursive && !options.noText) {
+    for (const candidate of buildLabeledSelectContextCandidates(injectedScript, targetElement))
       candidates.push({ candidate, isTextCandidate: true });
   }
   
@@ -843,6 +851,41 @@ function buildMenubarTargetSelector(element: Element): string | null {
   }
 
   return buildSimpleSelector(element);
+}
+
+function buildLabeledSelectContextCandidates(injectedScript: InjectedScript, element: Element): SelectorToken[][] {
+  const candidates: SelectorToken[][] = [];
+  if (element.nodeName !== 'SELECT')
+    return candidates;
+
+  const selectParent = element.parentElement;
+  const wrapper = selectParent?.parentElement;
+  if (!wrapper)
+    return candidates;
+
+  // Look for a label that directly precedes the select's container (not the first label in wrapper)
+  let labelElement = selectParent?.previousElementSibling;
+  if (labelElement && !labelElement.classList.contains('v-label'))
+    labelElement = null;
+  if (!labelElement)
+    return candidates;
+
+  const labelText = trimWordBoundary(elementText(injectedScript._evaluator._cacheText, labelElement).normalized, 40);
+  if (!labelText)
+    return candidates;
+
+  const containerSelectors = buildClassSelectorCandidates(wrapper);
+  const selectTarget = element.classList.contains('v-select-select') ? 'select.v-select-select' : 'select';
+
+  for (const containerSelector of containerSelectors.slice(0, 2)) {
+    candidates.push([
+      { engine: 'css', selector: containerSelector, score: kSelectContextScore },
+      { engine: 'internal:has-text', selector: escapeForTextSelector(labelText, false), score: kSelectContextTextScore },
+      { engine: 'css', selector: selectTarget, score: kSelectContextTargetScore }
+    ]);
+  }
+
+  return candidates;
 }
 
 // ============ End Table Row Context ============
