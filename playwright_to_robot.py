@@ -248,6 +248,12 @@ class PlaywrightToRobotConverter:
 
             return f"role={role}[name=/{_escape_regex(name)}/i]"
 
+        def _format_text_step(text: str, extra: Optional[str]) -> str:
+            extra = extra or ''
+            if re.search(r'exact\s*=\s*True', extra):
+                return f"text=/^{_escape_regex(text)}$/"
+            return f"text={text}"
+
         step_matches = []
 
         locator_patterns = [
@@ -264,8 +270,8 @@ class PlaywrightToRobotConverter:
                 lambda s, extra='': [_format_role_step(s, extra)],
             ),
             (
-                re.compile(r'get_by_text\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
-                lambda s: [f"text={s}"],
+                re.compile(r'get_by_text\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']([^\)]*)\)'),
+                lambda s, extra='': [_format_text_step(s, extra)],
             ),
             (
                 re.compile(r'get_by_label\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
