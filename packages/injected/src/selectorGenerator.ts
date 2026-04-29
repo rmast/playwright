@@ -77,6 +77,7 @@ const kSelectContextTargetScore = 75;
 
 const kNthScore = 10000;
 const kCSSFallbackScore = 10000000;
+const kMaxElementsPerStableClassCandidate = 12;
 
 const kScoreThresholdForTextExpect = 1000;
 
@@ -639,8 +640,26 @@ function isStableSelectorClass(className: string): boolean {
   return true;
 }
 
+function isOverlyGenericStableClass(className: string): boolean {
+  // Known high-cardinality utility classes in Vaadin-like UIs that tend to
+  // generate brittle selectors (e.g. .movable matching dozens of rows).
+  return className === 'movable' || className === 'selectable';
+}
+
+function isTooCommonClassOnPage(element: Element, className: string): boolean {
+  const escaped = escapeClassName(className);
+  if (!escaped)
+    return true;
+  return element.ownerDocument.querySelectorAll(`.${escaped}`).length > kMaxElementsPerStableClassCandidate;
+}
+
 function buildClassSelectorCandidates(element: Element): string[] {
-  const classes = [...element.classList].filter(isStableSelectorClass).slice(0, 2).map(escapeClassName);
+  const classes = [...element.classList]
+      .filter(isStableSelectorClass)
+      .filter(className => !isOverlyGenericStableClass(className))
+      .filter(className => !isTooCommonClassOnPage(element, className))
+      .slice(0, 2)
+      .map(escapeClassName);
   if (!classes.length)
     return [];
 
@@ -772,7 +791,12 @@ function buildSimpleSelector(element: Element): string | null {
   if (element.id && !isGuidLike(element.id))
     return `#${element.id}`;
   
-  const classes = [...element.classList].filter(c => !c.startsWith('v-') && c.length > 1);
+  const classes = [...element.classList].filter(c =>
+    !c.startsWith('v-')
+    && c.length > 1
+    && !isOverlyGenericStableClass(c)
+    && !isTooCommonClassOnPage(element, c)
+  );
   if (classes.length) {
     const classSelector = '.' + classes.slice(0, 2).join('.');
     return classSelector;
