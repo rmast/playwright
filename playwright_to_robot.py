@@ -231,6 +231,23 @@ class PlaywrightToRobotConverter:
 
             return None
 
+        def _format_role_step(role: str, extra: Optional[str]) -> str:
+            extra = extra or ''
+            name_match = re.search(
+                r'name\s*=\s*["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']',
+                extra,
+            )
+            name = _unescape(name_match.group(1)) if name_match else None
+            exact = bool(re.search(r'exact\s*=\s*True', extra))
+
+            if not name:
+                return f"role={role}"
+
+            if exact:
+                return f"role={role}[name=/^{_escape_regex(name)}$/]"
+
+            return f"role={role}[name=/{_escape_regex(name)}/i]"
+
         step_matches = []
 
         locator_patterns = [
@@ -242,18 +259,24 @@ class PlaywrightToRobotConverter:
             ),
             (
                 re.compile(
-                    r'get_by_role\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:,\s*name=["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'])?\)'
+                    r'get_by_role\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']([^\)]*)\)'
                 ),
-                lambda s, n=None: [f"role={s}[name=/{_escape_regex(n)}/i]" if n else f"role={s}"],
+                lambda s, extra='': [_format_role_step(s, extra)],
             ),
-            (re.compile(r'get_by_text\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'), lambda s: [f"text={s}"]),
-            (re.compile(r'get_by_label\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'), lambda s: [s]),
             (
-                re.compile(r'get_by_placeholder\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'),
+                re.compile(r'get_by_text\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
+                lambda s: [f"text={s}"],
+            ),
+            (
+                re.compile(r'get_by_label\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
+                lambda s: [s],
+            ),
+            (
+                re.compile(r'get_by_placeholder\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
                 lambda s: [f"placeholder={s}"],
             ),
             (
-                re.compile(r'get_by_test_id\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'),
+                re.compile(r'get_by_test_id\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:[^\)]*)\)'),
                 lambda s: [f"data-testid={s}"],
             ),
         ]
@@ -275,11 +298,11 @@ class PlaywrightToRobotConverter:
         for match in nth_pattern.finditer(line):
             step_matches.append((match.start(), [f'nth={match.group(1)}']))
 
-        first_pattern = re.compile(r'\.first\(\)')
+        first_pattern = re.compile(r'\.first(?:\(\))?(?=\.|$)')
         for match in first_pattern.finditer(line):
             step_matches.append((match.start(), ['nth=0']))
 
-        last_pattern = re.compile(r'\.last\(\)')
+        last_pattern = re.compile(r'\.last(?:\(\))?(?=\.|$)')
         for match in last_pattern.finditer(line):
             step_matches.append((match.start(), ['nth=-1']))
 
