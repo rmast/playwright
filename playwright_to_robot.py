@@ -495,6 +495,7 @@ class PlaywrightToRobotConverter:
     def _convert_click(self, action: Dict) -> str:
         """Convert click action to Robot Framework."""
         selector = self._simplify_selector(action.get("selector", ""))
+        selector = self._make_click_selector_strict_safe(selector)
         return f"Click{self.indent}{selector}"
 
     def _convert_fill(self, action: Dict) -> str:
@@ -542,7 +543,24 @@ class PlaywrightToRobotConverter:
     def _convert_dblclick(self, action: Dict) -> str:
         """Convert double-click action to Robot Framework."""
         selector = self._simplify_selector(action.get("selector", ""))
+        selector = self._make_click_selector_strict_safe(selector)
         return f"Click With Options{self.indent}{selector}{self.indent}clickCount=2"
+
+    def _make_click_selector_strict_safe(self, selector: str) -> str:
+        """Add deterministic disambiguation for bare exact-text selectors.
+
+        Playwright get_by_text(..., exact=True) can still match multiple visible
+        elements in Robot Browser strict mode (e.g. row label + heading). For a
+        plain exact text locator, append nth=0 to mirror deterministic first-hit
+        behavior and avoid strict-mode failures.
+        """
+        if not selector:
+            return selector
+        if ">>" in selector or "nth=" in selector:
+            return selector
+        if re.fullmatch(r'text=/\^.*\$/', selector):
+            return f"{selector} >> nth=0"
+        return selector
 
     def _convert_set_input_files(self, action: Dict) -> str:
         """Convert set_input_files action to Robot Framework."""
