@@ -513,7 +513,7 @@ class PlaywrightToRobotConverter:
     def _convert_dblclick(self, action: Dict) -> str:
         """Convert double-click action to Robot Framework."""
         selector = self._simplify_selector(action.get("selector", ""))
-        return f"Click{self.indent}{selector}{self.indent}clickCount=2"
+        return f"Click With Options{self.indent}{selector}{self.indent}clickCount=2"
 
     def _convert_set_input_files(self, action: Dict) -> str:
         """Convert set_input_files action to Robot Framework."""
