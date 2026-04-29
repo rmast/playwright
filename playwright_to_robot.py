@@ -244,7 +244,7 @@ class PlaywrightToRobotConverter:
                 re.compile(
                     r'get_by_role\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](?:,\s*name=["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'])?\)'
                 ),
-                lambda s, n=None: [f"role={s}[name='{n}']" if n else f"role={s}"],
+                lambda s, n=None: [f"role={s}[name=/{_escape_regex(n)}/i]" if n else f"role={s}"],
             ),
             (re.compile(r'get_by_text\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'), lambda s: [f"text={s}"]),
             (re.compile(r'get_by_label\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'), lambda s: [s]),
@@ -472,7 +472,17 @@ class PlaywrightToRobotConverter:
         """Convert fill action to Robot Framework."""
         selector = self._simplify_selector(action.get("selector", ""))
         value = action.get("value", "")
-        return f"Fill Text{self.indent}{selector}{self.indent}{value}"
+        keyword = "Type Text" if self._is_live_search_fill(selector) else "Fill Text"
+        return f"{keyword}{self.indent}{selector}{self.indent}{value}"
+
+    def _is_live_search_fill(self, selector: str) -> bool:
+        """Detect search textboxes that require key events instead of value assignment."""
+        if "searchtext" in selector:
+            return True
+
+        table_scopes = (".functie-table", ".activiteit-table", ".partenextfact-table")
+        is_scoped_search = any(scope in selector for scope in table_scopes)
+        return is_scoped_search and "role=textbox" in selector
 
     def _convert_press(self, action: Dict) -> str:
         """Convert press action to Robot Framework."""
