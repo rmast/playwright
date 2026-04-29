@@ -60,6 +60,7 @@ const kEndPenalizedScore = 300;
 const kCSSIdScore = 500;
 const kCSSClassScore = 505;
 const kRoleWithoutNameScore = 510;
+const kCSSFormInputNameScore = 502;  // Form input 'name' attribute: better than classes, worse than ID
 const kCSSInputTypeNameScore = 520;
 const kCSSTagNameScore = 530;
 
@@ -280,9 +281,12 @@ function buildNoTextCandidates(injectedScript: InjectedScript, element: Element,
         candidates.push({ engine: 'css', selector: makeSelectorForId(idAttr), score: kCSSIdScore });
     }
 
-    const classCandidates = buildClassSelectorCandidates(element);
-    for (let i = 0; i < classCandidates.length; i++)
-      candidates.push({ engine: 'css', selector: classCandidates[i], score: kCSSClassScore + i });
+    const isFormControl = ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.nodeName);
+    if (!isFormControl) {
+      const classCandidates = buildClassSelectorCandidates(element);
+      for (let i = 0; i < classCandidates.length; i++)
+        candidates.push({ engine: 'css', selector: classCandidates[i], score: kCSSClassScore + i });
+    }
 
     candidates.push({ engine: 'css', selector: escapeNodeName(element), score: kCSSTagNameScore });
   }
@@ -332,8 +336,11 @@ function buildNoTextCandidates(injectedScript: InjectedScript, element: Element,
   if (ariaRole && !['none', 'presentation'].includes(ariaRole))
     candidates.push({ engine: 'internal:role', selector: ariaRole, score: kRoleWithoutNameScore });
 
-  if (element.getAttribute('name') && ['BUTTON', 'FORM', 'FIELDSET', 'FRAME', 'IFRAME', 'INPUT', 'KEYGEN', 'OBJECT', 'OUTPUT', 'SELECT', 'TEXTAREA', 'MAP', 'META', 'PARAM'].includes(element.nodeName))
-    candidates.push({ engine: 'css', selector: `${escapeNodeName(element)}[name=${quoteCSSAttributeValue(element.getAttribute('name')!)}]`, score: kCSSInputTypeNameScore });
+  if (element.getAttribute('name') && ['BUTTON', 'FORM', 'FIELDSET', 'FRAME', 'IFRAME', 'INPUT', 'KEYGEN', 'OBJECT', 'OUTPUT', 'SELECT', 'TEXTAREA', 'MAP', 'META', 'PARAM'].includes(element.nodeName)) {
+    // Use better score for form inputs: name attribute is semantically important
+    const score = ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.nodeName) ? kCSSFormInputNameScore : kCSSInputTypeNameScore;
+    candidates.push({ engine: 'css', selector: `${escapeNodeName(element)}[name=${quoteCSSAttributeValue(element.getAttribute('name')!)}]`, score });
+  }
 
   if (['INPUT', 'TEXTAREA'].includes(element.nodeName) && element.getAttribute('type') !== 'hidden') {
     if (element.getAttribute('type'))
