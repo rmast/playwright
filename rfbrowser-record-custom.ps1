@@ -15,15 +15,22 @@ foreach ($target in $converterTargets) {
 	}
 }
 
-# Keep recorder runtimes in sync with local selector-generator build.
-$src = Resolve-Path ".\packages\playwright-core\lib\generated\injectedScriptSource.js"
-$targets = @(
-	".\.venv-recorder\Lib\site-packages\Browser\wrapper\node_modules\playwright-core\lib\generated\injectedScriptSource.js",
-	".\.venv-recorder\Lib\site-packages\playwright\driver\package\lib\generated\injectedScriptSource.js"
+# Keep recorder runtimes in sync with local generated Playwright sources.
+$generatedFiles = @(
+	"injectedScriptSource.js",
+	"pollingRecorderSource.js"
 )
-foreach ($target in $targets) {
-	if (Test-Path $target) {
-		Copy-Item -Path $src -Destination $target -Force
+
+foreach ($fileName in $generatedFiles) {
+	$src = Resolve-Path ".\packages\playwright-core\lib\generated\$fileName"
+	$targets = @(
+		".\.venv-recorder\Lib\site-packages\Browser\wrapper\node_modules\playwright-core\lib\generated\$fileName",
+		".\.venv-recorder\Lib\site-packages\playwright\driver\package\lib\generated\$fileName"
+	)
+	foreach ($target in $targets) {
+		if (Test-Path $target) {
+			Copy-Item -Path $src -Destination $target -Force
+		}
 	}
 }
 

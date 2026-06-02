@@ -58,11 +58,9 @@ interface RecorderTool {
   onPointerUp?(event: PointerEvent): void;
   onMouseDown?(event: MouseEvent): void;
   onMouseUp?(event: MouseEvent): void;
-  onMouseMove?(event: MouseEvent): void;
   onMouseEnter?(event: MouseEvent): void;
   onMouseLeave?(event: MouseEvent): void;
   onFocus?(event: Event): void;
-  onScroll?(event: Event): void;
 }
 
 class NoneTool implements RecorderTool {
@@ -252,13 +250,57 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
+
+    // Keep native navigation semantics for menu/navigation clicks.
+    // Record the click, but do not consume/replay it.
+    if (event.type === 'click' && event.button === 0 && event.detail === 1) {
+      const passthroughTarget = this._nativePassthroughTargetFromEvent(event);
+      if (passthroughTarget) {
+        const model = this._modelForTarget(passthroughTarget);
+        if (!model)
+          return;
+        this._recordAction({
+          name: 'click',
+          selector: model.selector,
+          position: positionForEvent(event),
+          signals: [],
+          button: buttonForEvent(event),
+          modifiers: modifiersForEvent(event),
+          clickCount: event.detail,
+        });
+        return;
+      }
+    }
+
+    // JSF-style submits should keep native browser navigation semantics.
+    // Record the click, but do not consume the event or replay it.
+    if (event.type === 'click' && event.button === 0 && event.detail === 1 && this._eventHasJsfSubmitTarget(event)) {
+      const jsfTarget = this._jsfSubmitElementFromEvent(event);
+      if (!jsfTarget)
+        return;
+      const model = this._modelForTarget(jsfTarget);
+      if (!model)
+        return;
+      this._recordAction({
+        name: 'click',
+        selector: model.selector,
+        position: positionForEvent(event),
+        signals: [],
+        button: buttonForEvent(event),
+        modifiers: modifiersForEvent(event),
+        clickCount: event.detail,
+      });
+      return;
+    }
+
     if (this._actionInProgress(event))
       return;
-    if (this._consumedDueToNoModel(event, this._hoveredModel))
+    const model = this._modelForMouseEvent(event);
+    if (this._consumedDueToNoModel(event, model))
       return;
 
     if (event.button === 2 && event.type === 'auxclick') {
-      this._showActionListDialog(this._hoveredModel!, event);
+      this._showActionListDialog(model!, event);
       return;
     }
 
@@ -267,7 +309,7 @@ class RecordActionTool implements RecorderTool {
       // Interestingly, inputElement.checked is reversed inside this event handler.
       this._performAction({
         name: checkbox.checked ? 'check' : 'uncheck',
-        selector: this._hoveredModel!.selector,
+        selector: model!.selector,
         signals: [],
       });
       return;
@@ -280,7 +322,7 @@ class RecordActionTool implements RecorderTool {
       this._pendingClickAction = {
         action: {
           name: 'click',
-          selector: this._hoveredModel!.selector,
+          selector: model!.selector,
           position: positionForEvent(event),
           signals: [],
           button: buttonForEvent(event),
@@ -302,14 +344,15 @@ class RecordActionTool implements RecorderTool {
     // Only allow double click dispatch while action is in progress.
     if (this._actionInProgress(event))
       return;
-    if (this._consumedDueToNoModel(event, this._hoveredModel))
+    const model = this._modelForMouseEvent(event);
+    if (this._consumedDueToNoModel(event, model))
       return;
 
     this._cancelPendingClickAction();
 
     this._performAction({
       name: 'click',
-      selector: this._hoveredModel!.selector,
+      selector: model!.selector,
       position: positionForEvent(event),
       signals: [],
       button: buttonForEvent(event),
@@ -351,6 +394,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
+    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+      return;
     this._consumeWhenAboutToPerform(event);
   }
 
@@ -358,6 +403,8 @@ class RecordActionTool implements RecorderTool {
     if (this._dialog.isShowing())
       return;
     if (this._shouldIgnoreMouseEvent(event))
+      return;
+    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
   }
@@ -367,6 +414,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
+    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+      return;
     this._consumeWhenAboutToPerform(event);
     this._activeModel = this._hoveredModel;
   }
@@ -375,6 +424,8 @@ class RecordActionTool implements RecorderTool {
     if (this._dialog.isShowing())
       return;
     if (this._shouldIgnoreMouseEvent(event))
+      return;
+    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
   }
@@ -646,6 +697,104 @@ class RecordActionTool implements RecorderTool {
     return true;
   }
 
+  private _isJsfSubmitTarget(target: HTMLElement | null): boolean {
+    if (!target)
+      return false;
+    const anchor = target.closest('a');
+    if (anchor) {
+      const href = anchor.getAttribute('href') || '';
+      const onclick = anchor.getAttribute('onclick') || '';
+      const hasOamSubmit = /\boamSubmitForm\s*\(/i.test(onclick) || /\boamSubmitForm\s*\(/i.test(href);
+      if (hasOamSubmit)
+        return true;
+    }
+
+    const submit = target.closest('input[type=submit], button[type=submit]') as HTMLInputElement | HTMLButtonElement | null;
+    if (!submit)
+      return false;
+    const form = submit.form;
+    if (!form)
+      return false;
+    const hasFacesState = !!form.querySelector('input[name="javax.faces.ViewState"]');
+    const action = form.getAttribute('action') || '';
+    return hasFacesState || action.includes('.jsf') || action.includes('j_spring_security_check');
+  }
+
+  private _eventHasJsfSubmitTarget(event: Event): boolean {
+    return !!this._jsfSubmitElementFromEvent(event);
+  }
+
+  private _jsfSubmitElementFromEvent(event: Event): HTMLElement | null {
+    for (const entry of event.composedPath()) {
+      if (!(entry instanceof HTMLElement))
+        continue;
+      const anchor = entry.closest('a');
+      if (anchor && this._isJsfSubmitTarget(anchor))
+        return anchor;
+      const submit = entry.closest('input[type=submit], button[type=submit]') as HTMLInputElement | HTMLButtonElement | null;
+      if (submit && this._isJsfSubmitTarget(submit))
+        return submit;
+
+      // Clicking menu container items (e.g. <li>) may not include the anchor in the path.
+      const descendantAnchors = entry.querySelectorAll('a[onclick], a[href^="javascript:"]');
+      for (const descendantAnchor of descendantAnchors) {
+        if (descendantAnchor instanceof HTMLAnchorElement && this._isJsfSubmitTarget(descendantAnchor))
+          return descendantAnchor;
+      }
+      const descendantSubmit = entry.querySelector('input[type=submit], button[type=submit]') as HTMLInputElement | HTMLButtonElement | null;
+      if (descendantSubmit && this._isJsfSubmitTarget(descendantSubmit))
+        return descendantSubmit;
+    }
+    return null;
+  }
+
+  private _nativePassthroughTargetFromEvent(event: Event): HTMLElement | null {
+    for (const entry of event.composedPath()) {
+      if (!(entry instanceof HTMLElement))
+        continue;
+
+      const anchor = entry.closest('a') as HTMLAnchorElement | null;
+      if (anchor) {
+        const href = anchor.getAttribute('href') || '';
+        const onclick = anchor.getAttribute('onclick') || '';
+        if (href || onclick)
+          return anchor;
+      }
+
+      const button = entry.closest('button, input[type=button], input[type=submit], input[type=image]') as HTMLElement | null;
+      if (button)
+        return button;
+
+      // Clicking menu containers (e.g. <li>) should still pass through to underlying interactive descendants.
+      const descendantAnchor = entry.querySelector('a[href], a[onclick]') as HTMLAnchorElement | null;
+      if (descendantAnchor)
+        return descendantAnchor;
+      const descendantButton = entry.querySelector('button, input[type=button], input[type=submit], input[type=image]') as HTMLElement | null;
+      if (descendantButton)
+        return descendantButton;
+    }
+    return null;
+  }
+
+  private _modelForTarget(target: HTMLElement): HighlightModelWithSelector | null {
+    if (!target.isConnected)
+      return null;
+    const { selector, elements } = this._recorder.injectedScript.generateSelector(target, { testIdAttributeName: this._recorder.state.testIdAttributeName });
+    if (!selector)
+      return null;
+    const model = { selector, elements, color: HighlightColors.action };
+    this._hoveredElement = target;
+    this._hoveredModel = model;
+    return model;
+  }
+
+  private _modelForMouseEvent(event: MouseEvent): HighlightModelWithSelector | null {
+    if (this._hoveredModel && this._hoveredElement?.isConnected)
+      return this._hoveredModel;
+    const target = this._recorder.deepEventTarget(event);
+    return this._modelForTarget(target);
+  }
+
   private _consumedDueWrongTarget(event: Event): boolean {
     if (this._activeModel && this._activeModel.elements[0] === this._recorder.deepEventTarget(event))
       return false;
@@ -666,8 +815,18 @@ class RecordActionTool implements RecorderTool {
     this._recorder.updateHighlight(null, false);
 
     this._performingActions.add(action);
+    const cleanupTimeout = this._recorder.injectedScript.utils.builtins.setTimeout(() => {
+      if (!this._performingActions.delete(action))
+        return;
+      // Some navigations can leave performAction unresolved; never keep recorder locked indefinitely.
+      this._onFocus(false);
+    }, 5000);
 
-    const promise = this._recorder.performAction(action).then(() => {
+    const promise = this._recorder.performAction(action);
+    void promise.catch(() => {
+      // Ignore action transport errors: recorder must recover and continue.
+    }).finally(() => {
+      this._recorder.injectedScript.utils.builtins.clearTimeout(cleanupTimeout);
       this._performingActions.delete(action);
       // If that was a keyboard action, it similarly requires new selectors for active model.
       this._onFocus(false);
