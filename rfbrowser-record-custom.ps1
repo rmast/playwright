@@ -15,6 +15,17 @@ foreach ($target in $converterTargets) {
 	}
 }
 
+# Keep tracked recorder source in sync (adds raw Playwright output artifact for diagnostics).
+$recorderSrc = Resolve-Path ".\robotframework_browser_recorder_recorder.py"
+$recorderTargets = @(
+	".\.venv-recorder\Lib\site-packages\robotframework_browser_recorder\recorder.py"
+)
+foreach ($target in $recorderTargets) {
+	if (Test-Path $target) {
+		Copy-Item -Path $recorderSrc -Destination $target -Force
+	}
+}
+
 # Keep recorder runtimes in sync with local generated Playwright sources.
 $generatedFiles = @(
 	"injectedScriptSource.js",

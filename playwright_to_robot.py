@@ -1,6 +1,9 @@
 """Convert Playwright Python code to Robot Framework Browser library syntax."""
 
+import json
+import os
 import re
+from urllib.parse import parse_qs
 from typing import List, Dict, Tuple, Optional
 
 
@@ -12,9 +15,19 @@ class PlaywrightToRobotConverter:
         self.indent = "    "
         self.action_mappings = {
             "goto": self._convert_goto,
+            "go_to": self._convert_go_to,
             "click": self._convert_click,
             "fill": self._convert_fill,
             "press": self._convert_press,
+            "login_submit": self._convert_login_submit,
+            "start_download_wait": self._convert_start_download_wait,
+            "finish_download_wait": self._convert_finish_download_wait,
+            "har_comment": self._convert_har_comment,
+            "har_fill": self._convert_har_fill,
+            "har_check": self._convert_har_check,
+            "har_click": self._convert_har_click,
+            "har_wait_load_state": self._convert_har_wait_load_state,
+            "har_wait_elements_state": self._convert_har_wait_elements_state,
             "select_option": self._convert_select_option,
             "check": self._convert_check,
             "uncheck": self._convert_uncheck,
@@ -44,6 +57,7 @@ class PlaywrightToRobotConverter:
         suite_name: str = "Recorded Test Suite",
         browser: str = "chromium",
         headless: bool = False,
+        har_path: Optional[str] = None,
     ) -> str:
         """Convert Playwright code to Robot Framework test.
 
@@ -58,6 +72,7 @@ class PlaywrightToRobotConverter:
             Robot Framework test case as a string
         """
         actions = self._parse_playwright_code(playwright_code)
+        actions = self._augment_actions_from_har(actions, har_path)
         robot_test = self._generate_robot_test(
             actions=actions,
             test_name=test_name,
@@ -78,10 +93,23 @@ class PlaywrightToRobotConverter:
         """
         actions = []
         lines = code.split("\n")
+        download_ctx_var = None
 
         for line in lines:
-            line = line.strip()
+            stripped = line.strip()
+            line = stripped
             if not line or line.startswith("#") or line.startswith("import"):
+                continue
+
+            if line.startswith("with page.expect_download()"):
+                ctx_match = re.search(r"\bas\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*$", line)
+                download_ctx_var = ctx_match.group(1) if ctx_match else "download_info"
+                actions.append({"type": "start_download_wait"})
+                continue
+
+            if download_ctx_var and f"{download_ctx_var}.value" in line:
+                actions.append({"type": "finish_download_wait"})
+                download_ctx_var = None
                 continue
 
             if "page.goto(" in line:
@@ -102,7 +130,13 @@ class PlaywrightToRobotConverter:
             elif ".press(" in line:
                 selector, key = self._extract_press_args(line)
                 if selector and key:
-                    actions.append({"type": "press", "selector": selector, "key": key})
+                    # Enter on a password field = form submit. Emit a click on the
+                    # submit button instead — more reliable than keyboard Enter for
+                    # JSF forms and avoids issues with focus/blur side effects.
+                    if key == "Enter" and "password" in selector:
+                        actions.append({"type": "login_submit"})
+                    else:
+                        actions.append({"type": "press", "selector": selector, "key": key})
 
             elif ".select_option(" in line:
                 selector, value = self._extract_select_args(line)
@@ -180,7 +214,51 @@ class PlaywrightToRobotConverter:
                     if title:
                         actions.append({"type": "expect_title", "title": title})
 
+        # Deduplicate consecutive fill actions on the same selector: if a fill is
+        # immediately followed by another fill on the same selector (with an optional
+        # Dead-key press in between), keep only the last fill.
+        actions = self._deduplicate_fills(actions)
+
         return actions
+
+    def _deduplicate_fills(self, actions: List[Dict]) -> List[Dict]:
+        """Remove redundant fill actions and navigational Tab presses between fills."""
+        result = []
+        i = 0
+        while i < len(actions):
+            a = actions[i]
+            if a.get("type") == "fill":
+                # Look ahead: skip Dead-key presses and collect subsequent fills on same selector
+                j = i + 1
+                last_fill = a
+                while j < len(actions):
+                    nxt = actions[j]
+                    if nxt.get("type") == "press" and nxt.get("key") in {"Dead", "Process", "Unidentified", "Compose"}:
+                        j += 1
+                        continue
+                    if nxt.get("type") == "fill" and nxt.get("selector") == a.get("selector"):
+                        last_fill = nxt
+                        j += 1
+                        continue
+                    break
+                result.append(last_fill)
+                # After a fill, strip a Tab/Shift+Tab that is immediately followed by
+                # another fill on a DIFFERENT field. These are "move focus to next field"
+                # keystrokes that in JSF/AJAX apps can trigger blur events resetting the form.
+                if (
+                    j < len(actions)
+                    and actions[j].get("type") == "press"
+                    and actions[j].get("key") in {"Tab", "Shift+Tab"}
+                    and j + 1 < len(actions)
+                    and actions[j + 1].get("type") == "fill"
+                    and actions[j + 1].get("selector") != a.get("selector")
+                ):
+                    j += 1  # skip the Tab
+                i = j
+            else:
+                result.append(a)
+                i += 1
+        return result
 
     def _extract_string_arg(self, line: str, arg_name: Optional[str] = None) -> Optional[str]:
         """Extract a string argument from a function call."""
@@ -361,6 +439,13 @@ class PlaywrightToRobotConverter:
         """Extract selector and key from press action."""
         parts = line.split(".press(")
         if len(parts) > 1:
+            selector = self._extract_selector(line)
+            key_pattern = r'\.press\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'
+            key_match = re.search(key_pattern, line)
+            if selector and key_match:
+                key = key_match.group(1).replace(r'\"', '"').replace(r"\'", "'")
+                return selector, key
+
             pattern = (
                 r'["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\s*,\s*'
                 r'["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']\)'
@@ -478,9 +563,14 @@ class PlaywrightToRobotConverter:
         if ">>" in selector:
             return selector
 
-        match = re.match(r'^\[([a-zA-Z-]+)=["\']([^"\']+)["\']\]$', selector)
+        match = re.match(r'''^\[([a-zA-Z-]+)=['"]([^'"]+)['"]\]$''', selector)
         if match:
             attr, value = match.groups()
+            # If the value contains a colon, stripping the brackets would create
+            # an invalid Playwright selector engine (e.g. name=form:field).
+            # Keep the CSS attribute selector syntax intact.
+            if ":" in value:
+                return selector
             return f"{attr}={value}"
 
         selector = re.sub(r'\[([a-zA-Z-]+)=["\']([^"\']+)["\']\]', r"[\1=\2]", selector)
@@ -491,6 +581,12 @@ class PlaywrightToRobotConverter:
         """Convert goto action to Robot Framework."""
         url = action.get("url", "")
         return f"New Page{self.indent}{url}"
+
+    def _convert_go_to(self, action: Dict) -> str:
+        """Convert in-context navigation to Robot Framework (Go To, not New Page)."""
+        url = action.get("url", "")
+        wait_line = f"Wait For Load State{self.indent}networkidle{self.indent}timeout=30s"
+        return f"Go To{self.indent}{url}\n{wait_line}"
 
     def _convert_click(self, action: Dict) -> str:
         """Convert click action to Robot Framework."""
@@ -506,7 +602,14 @@ class PlaywrightToRobotConverter:
         return f"{keyword}{self.indent}{selector}{self.indent}{value}"
 
     def _is_live_search_fill(self, selector: str) -> bool:
-        """Detect search textboxes that require key events instead of value assignment."""
+        """Detect fields that require character-by-character key events (Type Text)."""
+        # Password and username fields: Fill Text can trigger JSF AJAX blur events
+        # that reset the form. Type Text simulates real keystrokes and avoids this.
+        if "name=password" in selector or "type=password" in selector:
+            return True
+        if "name=username" in selector or "name=user" in selector:
+            return True
+
         if "searchtext" in selector:
             return True
 
@@ -516,8 +619,218 @@ class PlaywrightToRobotConverter:
 
     def _convert_press(self, action: Dict) -> str:
         """Convert press action to Robot Framework."""
+        selector = self._simplify_selector(action.get("selector", ""))
         key = action.get("key", "")
+        # Skip dead/composing keys that appear as recording artifacts
+        _SKIP_KEYS = {"Dead", "Process", "Unidentified", "Compose", "AltGraph"}
+        if key in _SKIP_KEYS:
+            return ""
+        if selector:
+            return f"Press Keys{self.indent}{selector}{self.indent}{key}"
         return f"Keyboard Key{self.indent}press{self.indent}{key}"
+
+    def _convert_login_submit(self, action: Dict) -> str:
+        """Convert a login form submission to clicking the submit button.
+
+        Clicking the submit button is more reliable than keyboard Enter for JSF
+        forms — Enter via Press Keys re-focuses the element and can trigger AJAX
+        blur events that reset the form before submission.
+        """
+        submit_sel = "css=input[type='submit'],button[type='submit'],input[name='login'],button[name='login']"
+        wait_line = f"Wait For Load State{self.indent}networkidle{self.indent}timeout=30s"
+        return f"Click{self.indent}{submit_sel}\n{wait_line}"
+    def _convert_har_comment(self, action: Dict) -> str:
+        text = action.get("text", "")
+        return f"# {text}" if text else ""
+
+    def _convert_har_fill(self, action: Dict) -> str:
+        selector = self._simplify_selector(action.get("selector", ""))
+        value = action.get("value", "")
+        return f"Fill Text{self.indent}{selector}{self.indent}{value}"
+
+    def _convert_har_check(self, action: Dict) -> str:
+        selector = self._simplify_selector(action.get("selector", ""))
+        return f"Check Checkbox{self.indent}{selector}"
+
+    def _convert_har_click(self, action: Dict) -> str:
+        selector = self._simplify_selector(action.get("selector", ""))
+        selector = self._make_click_selector_strict_safe(selector)
+        return f"Click{self.indent}{selector}"
+
+    def _convert_har_wait_load_state(self, action: Dict) -> str:
+        state = action.get("state", "networkidle")
+        timeout = action.get("timeout", "30s")
+        return f"Wait For Load State{self.indent}{state}{self.indent}timeout={timeout}"
+
+    def _convert_har_wait_elements_state(self, action: Dict) -> str:
+        selector = action.get("selector", "")
+        state = action.get("state", "visible")
+        timeout = action.get("timeout", "30s")
+        return f"Wait For Elements State{self.indent}{selector}{self.indent}{state}{self.indent}timeout={timeout}"
+
+    def _convert_start_download_wait(self, action: Dict) -> str:
+        """Start waiting for a download using Browser promise API."""
+        return "${download_promise}=    Promise To Wait For Download"
+
+    def _convert_finish_download_wait(self, action: Dict) -> str:
+        """Resolve download wait and keep a handle for potential later use."""
+        return "${download}=    Wait For    ${download_promise}"
+
+    def _augment_actions_from_har(self, actions: List[Dict], har_path: Optional[str]) -> List[Dict]:
+        """Add HAR-inferred report inputs when recorder/codegen misses UI actions.
+
+        This is a pragmatic fallback for JSF flows where UI interactions are visible
+        in network POST data but are absent from recorded Playwright actions.
+        """
+        if not har_path or not os.path.exists(har_path):
+            return actions
+
+        try:
+            with open(har_path, "r", encoding="utf-8") as f:
+                har = json.load(f)
+        except Exception:
+            return actions
+
+        latest_sbc_code: Optional[str] = None
+        checkbox_true = False
+        clicked_create_button = False
+
+        entries = har.get("log", {}).get("entries", [])
+        for entry in entries:
+            post_data = entry.get("request", {}).get("postData", {})
+            text = post_data.get("text")
+            if not text:
+                continue
+            params = parse_qs(text, keep_blank_values=True)
+
+            sbc_values = params.get("adaReportPage:functiesPerSbcCode") or params.get("adaReportPage%3AfunctiesPerSbcCode")
+            if sbc_values:
+                value = sbc_values[-1].strip()
+                if value:
+                    latest_sbc_code = value
+
+            checkbox_values = params.get("adaReportPage:functiesPerSbcCodeCheckbox") or params.get("adaReportPage%3AfunctiesPerSbcCodeCheckbox")
+            if checkbox_values and checkbox_values[-1].lower() == "true":
+                checkbox_true = True
+
+            create_values = params.get("adaReportPage:createButton") or params.get("adaReportPage%3AcreateButton")
+            if create_values:
+                clicked_create_button = True
+
+        if not latest_sbc_code:
+            return actions
+
+        has_sbc_in_actions = any(
+            a.get("type") == "fill" and str(a.get("value", "")).strip() == latest_sbc_code
+            for a in actions
+        )
+        if has_sbc_in_actions:
+            return actions
+
+        injected = [
+            {
+                "type": "har_comment",
+                "text": f"HAR inferred missing UI steps: functiesPerSbcCode={latest_sbc_code}",
+            },
+            {
+                "type": "har_fill",
+                "selector": "[name='adaReportPage:functiesPerSbcCode']",
+                "value": latest_sbc_code,
+            },
+        ]
+        if checkbox_true:
+            injected.append({
+                "type": "har_check",
+                "selector": "[name='adaReportPage:functiesPerSbcCodeCheckbox']",
+            })
+        if clicked_create_button:
+            injected.append({
+                "type": "har_click",
+                "selector": "text=/Rapport aanmaken/i",
+            })
+
+        insert_idx = next(
+            (i for i, a in enumerate(actions) if a.get("type") == "start_download_wait"),
+            len(actions),
+        )
+
+        # The recorder captures the ADA page navigation as a goto action inside
+        # expect_download, which the converter puts AFTER start_download_wait.
+        # We restructure: move that goto before the form steps (as a Go To),
+        # then inject the form steps, then start_download_wait, then har_click.
+        #
+        # Correct Robot Framework Browser download flow:
+        #   Go To    <ada page>
+        #   Fill Text / Check Checkbox
+        #   ${promise}=  Promise To  Wait For Download
+        #   Click    <create button>          <- triggers the download
+        #   ${dl}=   Wait For  ${promise}
+
+        # Look for a goto action immediately after start_download_wait that
+        # navigates to the ADA page — that is the download trigger navigation.
+        before = actions[:insert_idx]
+        download_block = actions[insert_idx:]  # [start_download_wait, goto(ada), finish_download_wait]
+
+        ada_nav = None
+        rest = []
+        for a in download_block:
+            if (
+                ada_nav is None
+                and a.get("type") == "goto"
+                and "ada" in a.get("url", "")
+            ):
+                # Promote to a go_to action (Go To, not New Page) to use same context
+                ada_nav = {"type": "go_to", "url": a["url"]}
+            else:
+                rest.append(a)
+
+        # Build injected steps: form fill + checkbox; click goes after start_download_wait
+        # Menu click + waits + checkbox first (checkbox reveals the text field) + fill
+        form_steps = [
+            {
+                "type": "har_click",
+                "selector": "id=mainmenuform:mainmenu_rapportage",
+            },
+            {
+                "type": "har_wait_load_state",
+                "state": "networkidle",
+                "timeout": "30s",
+            },
+            {
+                "type": "har_comment",
+                "text": f"HAR inferred missing UI steps: functiesPerSbcCode={latest_sbc_code}",
+            },
+        ]
+        if checkbox_true:
+            form_steps += [
+                {
+                    "type": "har_check",
+                    "selector": "[name='adaReportPage:functiesPerSbcCodeCheckbox']",
+                },
+                {
+                    "type": "har_wait_elements_state",
+                    "selector": "[name='adaReportPage:functiesPerSbcCode']",
+                    "state": "visible",
+                    "timeout": "30s",
+                },
+            ]
+        form_steps.append({
+            "type": "har_fill",
+            "selector": "[name='adaReportPage:functiesPerSbcCode']",
+            "value": latest_sbc_code,
+        })
+
+        click_step = []
+        if clicked_create_button:
+            click_step = [{"type": "har_click", "selector": "text=/Rapport aanmaken/i"}]
+
+        # Extract start_download_wait from rest (it may still be there)
+        start_dw = [a for a in rest if a.get("type") == "start_download_wait"]
+        finish_dw = [a for a in rest if a.get("type") != "start_download_wait"]
+
+        nav_prefix = [ada_nav] if ada_nav else []
+
+        return before + nav_prefix + form_steps + start_dw + click_step + finish_dw
 
     def _convert_select_option(self, action: Dict) -> str:
         """Convert select_option to Robot Framework."""
@@ -659,7 +972,9 @@ class PlaywrightToRobotConverter:
                 converter = self.action_mappings[action_type]
                 robot_line = converter(action)
                 if robot_line:
-                    lines.append(f"{self.indent}{robot_line}")
+                    for sub_line in robot_line.split("\n"):
+                        if sub_line:
+                            lines.append(f"{self.indent}{sub_line}")
 
         lines.append("")
         return "\n".join(lines)

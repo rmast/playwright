@@ -256,10 +256,10 @@ class RecordActionTool implements RecorderTool {
     if (event.type === 'click' && event.button === 0 && event.detail === 1) {
       const passthroughTarget = this._nativePassthroughTargetFromEvent(event);
       if (passthroughTarget) {
-        const model = this._modelForTarget(passthroughTarget);
+        const model = this._bestEffortModelForClick(event, passthroughTarget);
         if (!model)
           return;
-        this._recordAction({
+        const action: actions.ClickAction = {
           name: 'click',
           selector: model.selector,
           position: positionForEvent(event),
@@ -267,7 +267,8 @@ class RecordActionTool implements RecorderTool {
           button: buttonForEvent(event),
           modifiers: modifiersForEvent(event),
           clickCount: event.detail,
-        });
+        };
+        this._recordAction(action);
         return;
       }
     }
@@ -753,6 +754,17 @@ class RecordActionTool implements RecorderTool {
       if (!(entry instanceof HTMLElement))
         continue;
 
+      // CBBS top-level tabs can be menu containers without direct anchor/button semantics.
+      const cbbsMenuContainer = entry.closest('[id^="mainmenuform:"]') as HTMLElement | null;
+      if (cbbsMenuContainer)
+        return cbbsMenuContainer;
+
+      if (this._looksNativeClickable(entry))
+        return entry;
+
+      if (entry.hasAttribute('onclick'))
+        return entry;
+
       const anchor = entry.closest('a') as HTMLAnchorElement | null;
       if (anchor) {
         const href = anchor.getAttribute('href') || '';
@@ -769,11 +781,40 @@ class RecordActionTool implements RecorderTool {
       const descendantAnchor = entry.querySelector('a[href], a[onclick]') as HTMLAnchorElement | null;
       if (descendantAnchor)
         return descendantAnchor;
+      const descendantOnClick = entry.querySelector('[onclick]') as HTMLElement | null;
+      if (descendantOnClick)
+        return descendantOnClick;
       const descendantButton = entry.querySelector('button, input[type=button], input[type=submit], input[type=image]') as HTMLElement | null;
       if (descendantButton)
         return descendantButton;
+      const descendantCbbsMenu = entry.querySelector('[id^="mainmenuform:"]') as HTMLElement | null;
+      if (descendantCbbsMenu)
+        return descendantCbbsMenu;
+      const descendantInteractive = entry.querySelector('a[href], button, input[type=button], input[type=submit], input[type=image], [role=button], [role=link], [role=menuitem], [role=tab]') as HTMLElement | null;
+      if (descendantInteractive && this._looksNativeClickable(descendantInteractive))
+        return descendantInteractive;
     }
     return null;
+  }
+
+  private _looksNativeClickable(element: HTMLElement): boolean {
+    const tagName = element.tagName;
+    if (tagName === 'A' || tagName === 'BUTTON' || tagName === 'SUMMARY')
+      return true;
+
+    if (tagName === 'INPUT') {
+      const type = (element as HTMLInputElement).type?.toLowerCase() || '';
+      return type === 'button' || type === 'submit' || type === 'image';
+    }
+
+    if (element.hasAttribute('onclick'))
+      return true;
+
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    if (['button', 'link', 'menuitem', 'tab'].includes(role))
+      return true;
+
+    return false;
   }
 
   private _modelForTarget(target: HTMLElement): HighlightModelWithSelector | null {
@@ -793,6 +834,13 @@ class RecordActionTool implements RecorderTool {
       return this._hoveredModel;
     const target = this._recorder.deepEventTarget(event);
     return this._modelForTarget(target);
+  }
+
+  private _bestEffortModelForClick(event: MouseEvent, preferredTarget?: HTMLElement): HighlightModelWithSelector | null {
+    return (preferredTarget ? this._modelForTarget(preferredTarget) : null)
+      || this._modelForMouseEvent(event)
+      || this._activeModel
+      || this._hoveredModel;
   }
 
   private _consumedDueWrongTarget(event: Event): boolean {
@@ -820,7 +868,7 @@ class RecordActionTool implements RecorderTool {
         return;
       // Some navigations can leave performAction unresolved; never keep recorder locked indefinitely.
       this._onFocus(false);
-    }, 5000);
+    }, 2000);
 
     const promise = this._recorder.performAction(action);
     void promise.catch(() => {
