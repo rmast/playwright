@@ -52,6 +52,7 @@ interface RecorderTool {
   onContextMenu?(event: MouseEvent): void;
   onDragStart?(event: DragEvent): void;
   onInput?(event: Event): void;
+  onChange?(event: Event): void;
   onKeyDown?(event: KeyboardEvent): void;
   onKeyUp?(event: KeyboardEvent): void;
   onPointerDown?(event: PointerEvent): void;
@@ -197,6 +198,7 @@ class RecordActionTool implements RecorderTool {
   private _pendingClickAction: { action: actions.ClickAction, timeout: number } | undefined;
   private _observer: MutationObserver | null = null;
   private _dialog: Dialog;
+  private _lastRecordedEditableValues = new WeakMap<HTMLElement, string>();
 
   constructor(recorder: Recorder) {
     this._recorder = recorder;
@@ -250,20 +252,47 @@ class RecordActionTool implements RecorderTool {
     // So we check the hovered element instead, and if it is a range input, we skip click handling
     if (isRangeInput(this._hoveredElement))
       return;
-    if (this._shouldIgnoreMouseEvent(event))
+    if (this._shouldIgnoreMouseEvent(event)) {
+      recorderDebug('onClick.skip.ignoreMouseEvent', { target: describeTarget(this._recorder.deepEventTarget(event)), type: event.type });
       return;
+    }
 
-    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+    const clickTarget = this._recorder.deepEventTarget(event);
+    const checkboxTarget = checkboxForTarget(clickTarget);
+    const blockPassthrough = this._isValueControlTarget(clickTarget);
 
     // Keep native navigation semantics for menu/navigation clicks.
     // Record the click, but do not consume/replay it.
-    if (!checkboxTarget && event.type === 'click' && event.button === 0 && event.detail === 1) {
+    if (!checkboxTarget && !blockPassthrough && event.type === 'click' && event.button === 0 && event.detail === 1) {
       const passthroughTarget = this._nativePassthroughTargetFromEvent(event);
       if (passthroughTarget) {
         const model = this._bestEffortModelForClick(event, passthroughTarget);
-        if (!model)
+        if (model) {
+          const action: actions.ClickAction = {
+            name: 'click',
+            selector: model.selector,
+            position: positionForEvent(event),
+            signals: [],
+            button: buttonForEvent(event),
+            modifiers: modifiersForEvent(event),
+            clickCount: event.detail,
+          };
+          this._recordAction(action);
           return;
-        const action: actions.ClickAction = {
+        }
+        recorderDebug('onClick.passthrough.noModel.fallthrough', { target: describeTarget(passthroughTarget) });
+      }
+    }
+
+    // JSF-style submits should keep native browser navigation semantics.
+    // Record the click, but do not consume the event or replay it.
+    if (!checkboxTarget && !blockPassthrough && event.type === 'click' && event.button === 0 && event.detail === 1 && this._eventHasJsfSubmitTarget(event)) {
+      const jsfTarget = this._jsfSubmitElementFromEvent(event);
+      if (!jsfTarget)
+        return;
+      const model = this._modelForTarget(jsfTarget);
+      if (model) {
+        this._recordAction({
           name: 'click',
           selector: model.selector,
           position: positionForEvent(event),
@@ -271,36 +300,19 @@ class RecordActionTool implements RecorderTool {
           button: buttonForEvent(event),
           modifiers: modifiersForEvent(event),
           clickCount: event.detail,
-        };
-        this._recordAction(action);
+        });
         return;
       }
+      recorderDebug('onClick.jsfSubmit.noModel.fallthrough', { target: describeTarget(jsfTarget) });
     }
 
-    // JSF-style submits should keep native browser navigation semantics.
-    // Record the click, but do not consume the event or replay it.
-    if (!checkboxTarget && event.type === 'click' && event.button === 0 && event.detail === 1 && this._eventHasJsfSubmitTarget(event)) {
-      const jsfTarget = this._jsfSubmitElementFromEvent(event);
-      if (!jsfTarget)
-        return;
-      const model = this._modelForTarget(jsfTarget);
-      if (!model)
-        return;
-      this._recordAction({
-        name: 'click',
-        selector: model.selector,
-        position: positionForEvent(event),
-        signals: [],
-        button: buttonForEvent(event),
-        modifiers: modifiersForEvent(event),
-        clickCount: event.detail,
-      });
+    if (this._actionInProgress(event)) {
+      recorderDebug('onClick.skip.actionInProgress', { target: describeTarget(clickTarget), type: event.type });
       return;
     }
-
-    if (this._actionInProgress(event))
-      return;
-    const model = checkboxTarget ? (this._modelForTarget(checkboxTarget) || this._modelForMouseEvent(event)) : this._modelForMouseEvent(event);
+    let model = checkboxTarget ? (this._modelForTarget(checkboxTarget) || this._modelForMouseEvent(event)) : this._modelForMouseEvent(event);
+    if (!model)
+      model = this._modelForTarget(clickTarget);
     if (this._consumedDueToNoModel(event, model))
       return;
 
@@ -310,10 +322,11 @@ class RecordActionTool implements RecorderTool {
     }
 
     if (checkboxTarget && event.detail === 1) {
+      const selector = toggleControlSelector(checkboxTarget, model!.selector)!;
       // Interestingly, inputElement.checked is reversed inside this event handler.
       this._performAction({
         name: checkboxTarget.checked ? 'check' : 'uncheck',
-        selector: model!.selector,
+        selector,
         signals: [],
       });
       return;
@@ -471,6 +484,7 @@ class RecordActionTool implements RecorderTool {
     const target = this._recorder.deepEventTarget(event);
 
     if (target.nodeName === 'INPUT' && (target as HTMLInputElement).type.toLowerCase() === 'file') {
+      recorderDebug('onInput.file', { target: describeTarget(target) });
       this._recordAction({
         name: 'setInputFiles',
         selector: this._activeModel!.selector,
@@ -481,6 +495,8 @@ class RecordActionTool implements RecorderTool {
     }
 
     if (isRangeInput(target)) {
+      this._lastRecordedEditableValues.set(target, target.value);
+      recorderDebug('onInput.range', { target: describeTarget(target), value: target.value });
       this._recordAction({
         name: 'fill',
         // must use hoveredModel instead of activeModel for it to work in webkit
@@ -492,20 +508,45 @@ class RecordActionTool implements RecorderTool {
     }
 
     if (['INPUT', 'TEXTAREA'].includes(target.nodeName) || target.isContentEditable) {
-      if (target.nodeName === 'INPUT' && ['checkbox', 'radio'].includes((target as HTMLInputElement).type.toLowerCase())) {
-        // Checkbox is handled in click, we can't let input trigger on checkbox - that would mean we dispatched click events while recording.
+      if (target.nodeName === 'INPUT' && !isFillableInput(target as HTMLInputElement)) {
+        // Non-fillable inputs (checkbox/radio/submit/etc.) are handled by click/other actions.
+        recorderDebug('onInput.skip.nonFillable', { target: describeTarget(target), type: (target as HTMLInputElement).type });
         return;
       }
 
+      const fallbackSelector = valueControlSelector(target as HTMLElement, this._activeModel?.selector || this._hoveredModel?.selector);
+
       // Non-navigating actions are simply recorded by Playwright.
-      if (this._consumedDueWrongTarget(event))
+      if (this._consumedDueWrongTarget(event)) {
+        if (!fallbackSelector)
+          return;
+        recorderDebug('onInput.fallbackSelector', { target: describeTarget(target), selector: fallbackSelector });
+        this._recordAction({
+          name: 'fill',
+          selector: fallbackSelector,
+          signals: [],
+          text: target.isContentEditable ? target.innerText : (target as HTMLInputElement).value,
+        });
         return;
+      }
+
+      const generatedSelector = this._selectorForTarget(target as HTMLElement);
+      const selector = this._activeModel?.selector || fallbackSelector || generatedSelector;
+      if (!selector) {
+        recorderDebug('onInput.skip.noSelector', { target: describeTarget(target) });
+        return;
+      }
+
+      recorderDebug('onInput.fill', { target: describeTarget(target), selector });
       this._recordAction({
         name: 'fill',
-        selector: this._activeModel!.selector,
+        selector,
         signals: [],
         text: target.isContentEditable ? target.innerText : (target as HTMLInputElement).value,
       });
+      const value = editableControlValue(target);
+      if (value !== undefined)
+        this._lastRecordedEditableValues.set(target, value);
     }
 
     if (target.nodeName === 'SELECT') {
@@ -517,6 +558,17 @@ class RecordActionTool implements RecorderTool {
         signals: []
       });
     }
+  }
+
+  onChange(event: Event) {
+    const target = this._recorder.deepEventTarget(event);
+    const value = editableControlValue(target);
+    if (value !== undefined && this._lastRecordedEditableValues.get(target) === value) {
+      recorderDebug('onChange.skip.duplicateValue', { target: describeTarget(target), value });
+      return;
+    }
+    recorderDebug('onChange.forwardToInput', { target: describeTarget(target), value });
+    this.onInput(event);
   }
 
   onKeyDown(event: KeyboardEvent) {
@@ -532,11 +584,12 @@ class RecordActionTool implements RecorderTool {
       return;
     // Similarly to click, trigger checkbox on key event, not input.
     if (event.key === ' ') {
-      const checkbox = asCheckbox(this._recorder.deepEventTarget(event));
+      const checkbox = checkboxForTarget(this._recorder.deepEventTarget(event));
       if (checkbox && event.detail === 0) {
+        const selector = toggleControlSelector(checkbox, this._activeModel!.selector)!;
         this._performAction({
           name: checkbox.checked ? 'uncheck' : 'check',
-          selector: this._activeModel!.selector,
+          selector,
           signals: [],
         });
         return;
@@ -701,6 +754,7 @@ class RecordActionTool implements RecorderTool {
   private _consumedDueToNoModel(event: Event, model: HighlightModel | null): boolean {
     if (model)
       return false;
+    recorderDebug('event.skip.noModel', { target: describeTarget(this._recorder.deepEventTarget(event)), type: event.type });
     consumeEvent(event);
     return true;
   }
@@ -713,7 +767,9 @@ class RecordActionTool implements RecorderTool {
       const href = anchor.getAttribute('href') || '';
       const onclick = anchor.getAttribute('onclick') || '';
       const hasOamSubmit = /\boamSubmitForm\s*\(/i.test(onclick) || /\boamSubmitForm\s*\(/i.test(href);
-      if (hasOamSubmit)
+      // Menu-style JSF anchors should be handled as regular click actions.
+      // Passthrough here tends to collapse the timeline into a bare navigation.
+      if (hasOamSubmit && !this._isMenuSubmitAnchor(anchor))
         return true;
     }
 
@@ -728,11 +784,28 @@ class RecordActionTool implements RecorderTool {
     return hasFacesState || action.includes('.jsf') || action.includes('j_spring_security_check');
   }
 
+  private _isMenuSubmitAnchor(anchor: HTMLAnchorElement): boolean {
+    const onclick = anchor.getAttribute('onclick') || '';
+    const href = anchor.getAttribute('href') || '';
+    const id = anchor.id || '';
+    if (/mainmenuform:/i.test(id))
+      return true;
+    if (/oamSubmitForm\s*\(\s*['"]mainmenuform['"]/i.test(onclick))
+      return true;
+    if (/oamSubmitForm\s*\(\s*['"]mainmenuform['"]/i.test(href))
+      return true;
+    return false;
+  }
+
   private _eventHasJsfSubmitTarget(event: Event): boolean {
     return !!this._jsfSubmitElementFromEvent(event);
   }
 
   private _jsfSubmitElementFromEvent(event: Event): HTMLElement | null {
+    const initialTarget = this._recorder.deepEventTarget(event);
+    if (this._isValueControlTarget(initialTarget))
+      return null;
+
     for (const entry of event.composedPath()) {
       if (!(entry instanceof HTMLElement))
         continue;
@@ -743,28 +816,29 @@ class RecordActionTool implements RecorderTool {
       if (submit && this._isJsfSubmitTarget(submit))
         return submit;
 
-      // Clicking menu container items (e.g. <li>) may not include the anchor in the path.
-      const descendantAnchors = entry.querySelectorAll('a[onclick], a[href^="javascript:"]');
-      for (const descendantAnchor of descendantAnchors) {
-        if (descendantAnchor instanceof HTMLAnchorElement && this._isJsfSubmitTarget(descendantAnchor))
-          return descendantAnchor;
+      // For menu containers, click path may not include the actionable descendant.
+      if (this._isMenuLikeContainer(entry)) {
+        const descendantAnchors = entry.querySelectorAll('a[onclick], a[href^="javascript:"]');
+        for (const descendantAnchor of descendantAnchors) {
+          if (descendantAnchor instanceof HTMLAnchorElement && this._isJsfSubmitTarget(descendantAnchor))
+            return descendantAnchor;
+        }
+        const descendantSubmit = entry.querySelector('input[type=submit], button[type=submit]') as HTMLInputElement | HTMLButtonElement | null;
+        if (descendantSubmit && this._isJsfSubmitTarget(descendantSubmit))
+          return descendantSubmit;
       }
-      const descendantSubmit = entry.querySelector('input[type=submit], button[type=submit]') as HTMLInputElement | HTMLButtonElement | null;
-      if (descendantSubmit && this._isJsfSubmitTarget(descendantSubmit))
-        return descendantSubmit;
     }
     return null;
   }
 
   private _nativePassthroughTargetFromEvent(event: Event): HTMLElement | null {
+    const initialTarget = this._recorder.deepEventTarget(event);
+    if (this._isValueControlTarget(initialTarget))
+      return null;
+
     for (const entry of event.composedPath()) {
       if (!(entry instanceof HTMLElement))
         continue;
-
-      // CBBS top-level tabs can be menu containers without direct anchor/button semantics.
-      const cbbsMenuContainer = entry.closest('[id^="mainmenuform:"]') as HTMLElement | null;
-      if (cbbsMenuContainer)
-        return cbbsMenuContainer;
 
       if (this._looksNativeClickable(entry))
         return entry;
@@ -774,6 +848,8 @@ class RecordActionTool implements RecorderTool {
 
       const anchor = entry.closest('a') as HTMLAnchorElement | null;
       if (anchor) {
+        if (this._isMenuSubmitAnchor(anchor))
+          continue;
         const href = anchor.getAttribute('href') || '';
         const onclick = anchor.getAttribute('onclick') || '';
         if (href || onclick)
@@ -785,23 +861,43 @@ class RecordActionTool implements RecorderTool {
         return button;
 
       // Clicking menu containers (e.g. <li>) should still pass through to underlying interactive descendants.
-      const descendantAnchor = entry.querySelector('a[href], a[onclick]') as HTMLAnchorElement | null;
-      if (descendantAnchor)
-        return descendantAnchor;
-      const descendantOnClick = entry.querySelector('[onclick]') as HTMLElement | null;
-      if (descendantOnClick)
-        return descendantOnClick;
-      const descendantButton = entry.querySelector('button, input[type=button], input[type=submit], input[type=image]') as HTMLElement | null;
-      if (descendantButton)
-        return descendantButton;
-      const descendantCbbsMenu = entry.querySelector('[id^="mainmenuform:"]') as HTMLElement | null;
-      if (descendantCbbsMenu)
-        return descendantCbbsMenu;
-      const descendantInteractive = entry.querySelector('a[href], button, input[type=button], input[type=submit], input[type=image], [role=button], [role=link], [role=menuitem], [role=tab]') as HTMLElement | null;
-      if (descendantInteractive && this._looksNativeClickable(descendantInteractive))
-        return descendantInteractive;
+      if (this._isMenuLikeContainer(entry)) {
+        const descendantAnchor = entry.querySelector('a[href], a[onclick]') as HTMLAnchorElement | null;
+        if (descendantAnchor)
+          return descendantAnchor;
+        const descendantOnClick = entry.querySelector('[onclick]') as HTMLElement | null;
+        if (descendantOnClick)
+          return descendantOnClick;
+        const descendantButton = entry.querySelector('button, input[type=button], input[type=submit], input[type=image]') as HTMLElement | null;
+        if (descendantButton)
+          return descendantButton;
+        const descendantInteractive = entry.querySelector('a[href], button, input[type=button], input[type=submit], input[type=image], [role=button], [role=link], [role=menuitem], [role=tab]') as HTMLElement | null;
+        if (descendantInteractive instanceof HTMLAnchorElement && this._isMenuSubmitAnchor(descendantInteractive))
+          continue;
+        if (descendantInteractive && this._looksNativeClickable(descendantInteractive))
+          return descendantInteractive;
+      }
     }
     return null;
+  }
+
+  private _isValueControlTarget(target: HTMLElement | null): boolean {
+    const input = target?.closest('input') as HTMLInputElement | null;
+    if (input) {
+      const type = (input.type || '').toLowerCase();
+      if (!['button', 'submit', 'image'].includes(type))
+        return true;
+    }
+    if (target?.closest('textarea, select, [contenteditable=""], [contenteditable="true"]'))
+      return true;
+    return false;
+  }
+
+  private _isMenuLikeContainer(element: HTMLElement): boolean {
+    if (element.matches('[id^="mainmenuform:"]'))
+      return true;
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    return ['menu', 'menubar', 'menuitem', 'tab', 'tablist', 'treeitem', 'listitem'].includes(role);
   }
 
   private _looksNativeClickable(element: HTMLElement): boolean {
@@ -862,8 +958,19 @@ class RecordActionTool implements RecorderTool {
       if (this._activeModel && this._activeModel.elements[0] === eventTarget)
         return false;
     }
+    recorderDebug('event.skip.wrongTarget', {
+      type: event.type,
+      target: describeTarget(eventTarget),
+      activeSelector: this._activeModel?.selector,
+      activeConnected: this._activeModel ? this._recorder.document.contains(this._activeModel.elements[0]) : false,
+    });
     consumeEvent(event);
     return true;
+  }
+
+  private _selectorForTarget(target: HTMLElement): string | undefined {
+    const generated = this._recorder.injectedScript.generateSelector(target, { testIdAttributeName: this._recorder.state.testIdAttributeName }).selector;
+    return generated || undefined;
   }
 
   private _consumeWhenAboutToPerform(event: Event) {
@@ -872,6 +979,7 @@ class RecordActionTool implements RecorderTool {
   }
 
   private _recordAction(action: actions.Action) {
+    recorderDebug('recordAction.tool', { name: action.name, selector: (action as any).selector });
     this._recorder.recordAction(action);
   }
 
@@ -921,6 +1029,11 @@ class RecordActionTool implements RecorderTool {
     // Enter aka. new line is handled in input event.
     if (event.key === 'Enter' && (this._recorder.deepEventTarget(event).nodeName === 'TEXTAREA' || this._recorder.deepEventTarget(event).isContentEditable))
       return false;
+    // Let password-submit Enter propagate natively; recording synthetic press here
+    // can desynchronize recorder state around post-login navigations.
+    const enterTarget = this._recorder.deepEventTarget(event);
+    if (event.key === 'Enter' && enterTarget.nodeName === 'INPUT' && (enterTarget as HTMLInputElement).type.toLowerCase() === 'password')
+      return false;
     // Backspace, Delete, AltGraph are changing input, will handle it there.
     if (['Backspace', 'Delete', 'AltGraph'].includes(event.key))
       return false;
@@ -969,6 +1082,7 @@ class RecordActionTool implements RecorderTool {
 
 class JsonRecordActionTool implements RecorderTool {
   private _recorder: Recorder;
+  private _lastRecordedEditableValues = new WeakMap<HTMLElement, string>();
 
   constructor(recorder: Recorder) {
     this._recorder = recorder;
@@ -995,13 +1109,16 @@ class JsonRecordActionTool implements RecorderTool {
     if (this._shouldIgnoreMouseEvent(event))
       return;
 
-    const checkbox = asCheckbox(element);
+    const checkbox = checkboxForTarget(element);
     const { ariaSnapshot, selector, ref } = this._ariaSnapshot(element);
     if (checkbox && event.detail === 1) {
+      const checkboxSelector = toggleControlSelector(checkbox, selector) || this._ariaSnapshot(checkbox).selector;
+      if (!checkboxSelector)
+        return;
       // Interestingly, inputElement.checked is reversed inside this event handler.
       this._recorder.recordAction({
         name: checkbox.checked ? 'check' : 'uncheck',
-        selector,
+        selector: checkboxSelector,
         ref,
         signals: [],
         ariaSnapshot,
@@ -1043,6 +1160,7 @@ class JsonRecordActionTool implements RecorderTool {
 
     const { ariaSnapshot, selector, ref } = this._ariaSnapshot(element);
     if (isRangeInput(element)) {
+      this._lastRecordedEditableValues.set(element, element.value);
       this._recorder.recordAction({
         name: 'fill',
         selector,
@@ -1055,8 +1173,8 @@ class JsonRecordActionTool implements RecorderTool {
     }
 
     if (['INPUT', 'TEXTAREA'].includes(element.nodeName) || element.isContentEditable) {
-      if (element.nodeName === 'INPUT' && ['checkbox', 'radio'].includes((element as HTMLInputElement).type.toLowerCase())) {
-        // Checkbox is handled in click, we can't let input trigger on checkbox - that would mean we dispatched click events while recording.
+      if (element.nodeName === 'INPUT' && !isFillableInput(element as HTMLInputElement)) {
+        // Non-fillable inputs (checkbox/radio/submit/etc.) are handled by click/other actions.
         return;
       }
 
@@ -1068,6 +1186,9 @@ class JsonRecordActionTool implements RecorderTool {
         signals: [],
         text: element.isContentEditable ? element.innerText : (element as HTMLInputElement).value,
       });
+      const value = editableControlValue(element);
+      if (value !== undefined)
+        this._lastRecordedEditableValues.set(element, value);
       return;
     }
 
@@ -1085,6 +1206,14 @@ class JsonRecordActionTool implements RecorderTool {
     }
   }
 
+  onChange(event: Event) {
+    const target = this._recorder.deepEventTarget(event);
+    const value = editableControlValue(target);
+    if (value !== undefined && this._lastRecordedEditableValues.get(target) === value)
+      return;
+    this.onInput(event);
+  }
+
   onKeyDown(event: KeyboardEvent) {
     if (!this._shouldGenerateKeyPressFor(event))
       return;
@@ -1094,11 +1223,14 @@ class JsonRecordActionTool implements RecorderTool {
 
     // Similarly to click, trigger checkbox on key event, not input.
     if (event.key === ' ') {
-      const checkbox = asCheckbox(element);
+      const checkbox = checkboxForTarget(element);
       if (checkbox && event.detail === 0) {
+        const checkboxSelector = toggleControlSelector(checkbox, selector) || this._ariaSnapshot(checkbox).selector;
+        if (!checkboxSelector)
+          return;
         this._recorder.recordAction({
           name: checkbox.checked ? 'uncheck' : 'check',
-          selector,
+          selector: checkboxSelector,
           ref,
           ariaSnapshot,
           signals: [],
@@ -1139,6 +1271,9 @@ class JsonRecordActionTool implements RecorderTool {
 
     // Enter aka. new line is handled in input event.
     if (event.key === 'Enter' && (this._recorder.deepEventTarget(event).nodeName === 'TEXTAREA' || this._recorder.deepEventTarget(event).isContentEditable))
+      return false;
+    const enterTarget = this._recorder.deepEventTarget(event);
+    if (event.key === 'Enter' && enterTarget.nodeName === 'INPUT' && (enterTarget as HTMLInputElement).type.toLowerCase() === 'password')
       return false;
     // Backspace, Delete, AltGraph are changing input, will handle it there.
     if (['Backspace', 'Delete', 'AltGraph'].includes(event.key))
@@ -1662,6 +1797,7 @@ export class Recorder {
       addEventListener(this.document, 'contextmenu', event => this._onContextMenu(event as MouseEvent), true),
       addEventListener(this.document, 'dragstart', event => this._onDragStart(event as DragEvent), true),
       addEventListener(this.document, 'input', event => this._onInput(event), true),
+      addEventListener(this.document, 'change', event => this._onChange(event), true),
       addEventListener(this.document, 'keydown', event => this._onKeyDown(event as KeyboardEvent), true),
       addEventListener(this.document, 'keyup', event => this._onKeyUp(event as KeyboardEvent), true),
       addEventListener(this.document, 'pointerdown', event => this._onPointerDown(event as PointerEvent), true),
@@ -1875,6 +2011,12 @@ export class Recorder {
     this._currentTool.onInput?.(event);
   }
 
+  private _onChange(event: Event) {
+    if (this._ignoreOverlayEvent(event))
+      return;
+    this._currentTool.onChange?.(event);
+  }
+
   private _onKeyDown(event: KeyboardEvent) {
     if (!event.isTrusted)
       return;
@@ -1917,11 +2059,21 @@ export class Recorder {
   }
 
   deepEventTarget(event: Event): HTMLElement {
-    for (const element of event.composedPath()) {
-      if (!this.overlay?.contains(element as Element))
-        return element as HTMLElement;
+    for (const entry of event.composedPath()) {
+      if (!(entry instanceof Element))
+        continue;
+      if (this.overlay?.contains(entry))
+        continue;
+      if (entry instanceof HTMLElement)
+        return entry;
+      const parent = entry.parentElement;
+      if (parent)
+        return parent;
     }
-    return event.composedPath()[0] as HTMLElement;
+    const fallback = event.target;
+    if (fallback instanceof HTMLElement)
+      return fallback;
+    return this.document.body as HTMLElement;
   }
 
   setMode(mode: Mode) {
@@ -1946,6 +2098,7 @@ export class Recorder {
   }
 
   recordAction(action: actions.Action) {
+    recorderDebug('recordAction.delegate', { name: action.name, selector: (action as any).selector });
     this._lastActionAutoexpectSnapshot = this._captureAutoExpectSnapshot();
     void this._delegate.recordAction?.(action);
   }
@@ -2111,6 +2264,51 @@ function asCheckbox(node: Node | null): HTMLInputElement | null {
   return ['checkbox', 'radio'].includes(inputElement.type) ? inputElement : null;
 }
 
+function isFillableInput(input: HTMLInputElement): boolean {
+  const type = (input.type || 'text').toLowerCase();
+  return !['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'hidden', 'file', 'range'].includes(type);
+}
+
+function editableControlValue(target: HTMLElement): string | undefined {
+  if (target instanceof HTMLInputElement)
+    return target.value;
+  if (target instanceof HTMLTextAreaElement)
+    return target.value;
+  if (target.isContentEditable)
+    return target.innerText;
+  return undefined;
+}
+
+const RECORDER_DEBUG_ENABLED = true;
+
+function recorderDebug(event: string, details?: Record<string, unknown>) {
+  if (!RECORDER_DEBUG_ENABLED)
+    return;
+  const payload = details ? safeJson(details) : '';
+  const message = payload ? `[RECDBG] ${event} ${payload}` : `[RECDBG] ${event}`;
+  try {
+    console.error(message); // eslint-disable-line no-console
+  } catch {
+  }
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+function describeTarget(target: HTMLElement | null | undefined): string {
+  if (!target)
+    return '<null>';
+  const id = target.id ? `#${target.id}` : '';
+  const name = target.getAttribute('name') ? `[name=${target.getAttribute('name')}]` : '';
+  const role = target.getAttribute('role') ? `[role=${target.getAttribute('role')}]` : '';
+  return `${target.nodeName.toLowerCase()}${id}${name}${role}`;
+}
+
 function checkboxForTarget(target: HTMLElement | null): HTMLInputElement | null {
   const directCheckbox = asCheckbox(target);
   if (directCheckbox)
@@ -2134,6 +2332,38 @@ function checkboxForTarget(target: HTMLElement | null): HTMLInputElement | null 
 
   const nested = closestLabel.querySelector('input[type="checkbox"], input[type="radio"]');
   return asCheckbox(nested);
+}
+
+function toggleControlSelector(control: HTMLInputElement, fallbackSelector?: string): string | undefined {
+  if (control.id)
+    return `id=${control.id}`;
+
+  const type = control.type?.toLowerCase();
+  const name = control.getAttribute('name');
+  if (type && name)
+    return `input[type=${JSON.stringify(type)}][name=${JSON.stringify(name)}]`;
+  if (name)
+    return `input[name=${JSON.stringify(name)}]`;
+  return fallbackSelector;
+}
+
+function valueControlSelector(control: HTMLElement, fallbackSelector?: string): string | undefined {
+  if (control instanceof HTMLInputElement)
+    return toggleControlSelector(control, fallbackSelector);
+
+  if (control.id)
+    return `id=${control.id}`;
+
+  if (control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) {
+    const name = control.getAttribute('name');
+    if (name)
+      return `${control.tagName.toLowerCase()}[name=${JSON.stringify(name)}]`;
+  }
+
+  if (control.isContentEditable)
+    return fallbackSelector;
+
+  return fallbackSelector;
 }
 
 function readableOptionValue(option: HTMLOptionElement): string {

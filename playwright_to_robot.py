@@ -51,6 +51,10 @@ class PlaywrightToRobotConverter:
             "expect_title": self._convert_expect_title,
         }
 
+    def _env_truthy(self, name: str) -> bool:
+        value = os.environ.get(name, "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
     def convert(
         self,
         playwright_code: str,
@@ -125,7 +129,7 @@ class PlaywrightToRobotConverter:
 
             elif ".fill(" in line:
                 selector, value = self._extract_fill_args(line)
-                if selector and value:
+                if selector is not None and value is not None:
                     actions.append({"type": "fill", "selector": selector, "value": value})
 
             elif ".press(" in line:
@@ -219,8 +223,154 @@ class PlaywrightToRobotConverter:
         # immediately followed by another fill on the same selector (with an optional
         # Dead-key press in between), keep only the last fill.
         actions = self._deduplicate_fills(actions)
+        actions = self._ensure_login_submit(actions)
+        actions = self._stabilize_functie_tab_flow(actions)
 
         return actions
+
+    def _stabilize_functie_tab_flow(self, actions: List[Dict]) -> List[Dict]:
+        """Harden tab navigation for functie flows where codegen collapses state.
+
+        In some sessions codegen emits a goto to /functie/algemeen.jsf after
+        clicking the next button and then immediately records actions for fields
+        that live on other tabs (e.g. Opleidingseisen/Proces on Bekwaamheden).
+        This causes playback to stay on Algemeen and time out. Remove the
+        conflicting goto and ensure the Bekwaamheden tab is selected before
+        those field actions.
+        """
+
+        def _is_bekwaamheden_field_action(action: Dict) -> bool:
+            selector = (action.get("selector") or "").lower()
+            return (
+                "opleidingseisen" in selector
+                or "name=/proces/i" in selector
+            )
+
+        has_bekwaamheden_field_actions = any(_is_bekwaamheden_field_action(a) for a in actions)
+        if not has_bekwaamheden_field_actions:
+            return actions
+
+        stabilized: List[Dict] = []
+        inserted_bekwaamheden_click = False
+
+        for index, action in enumerate(actions):
+            action_type = action.get("type")
+            selector = (action.get("selector") or "")
+            selector_lower = selector.lower()
+            url = (action.get("url") or "").lower()
+
+            # Drop misleading navigation back to Algemeen when the flow is
+            # clearly moving forward to other tabs.
+            if action_type in {"goto", "go_to"} and "/functie/algemeen.jsf" in url:
+                prev = stabilized[-1] if stabilized else None
+                next_has_bekwaamheden = any(_is_bekwaamheden_field_action(a) for a in actions[index + 1:])
+                if prev and prev.get("type") == "click" and "nextbutton" in (prev.get("selector") or "").lower() and next_has_bekwaamheden:
+                    continue
+
+            # Ensure we are on the right tab before interacting with Bekwaamheden fields.
+            if _is_bekwaamheden_field_action(action) and not inserted_bekwaamheden_click:
+                recent_has_bekwaamheden_click = any(
+                    a.get("type") == "click"
+                    and (
+                        "role=link[name=/^bekwaamheden$/]" in (a.get("selector") or "").lower()
+                        or "role=tab[name=/bekwaamheden/i]" in (a.get("selector") or "").lower()
+                        or "text=bekwaamheden" in (a.get("selector") or "").lower()
+                    )
+                    for a in stabilized[-5:]
+                )
+                if not recent_has_bekwaamheden_click:
+                    stabilized.append({"type": "click", "selector": "role=link[name=/^Bekwaamheden$/]"})
+                inserted_bekwaamheden_click = True
+
+            stabilized.append(action)
+
+        # Secondary guard: if codegen/action flow jumps tabs implicitly,
+        # ensure Loongegevens is explicitly selected before its fields.
+        final_actions: List[Dict] = []
+        inserted_loongegevens_click = False
+        for action in stabilized:
+            selector = (action.get("selector") or "").lower()
+            is_loongegevens_field = "functieloongegevenspage:" in selector
+            if is_loongegevens_field and not inserted_loongegevens_click:
+                recent_has_loongegevens_click = any(
+                    a.get("type") == "click"
+                    and "role=link[name=/^loongegevens$/]" in (a.get("selector") or "").lower()
+                    for a in final_actions[-6:]
+                )
+                if not recent_has_loongegevens_click:
+                    final_actions.append({"type": "click", "selector": "role=link[name=/^Loongegevens$/]"})
+                inserted_loongegevens_click = True
+
+            # CBBS-specific hardening: role/name for contract hours can be flaky
+            # across partial rerenders. Prefer the stable field id when we are
+            # already in the Loongegevens flow.
+            if action.get("type") == "fill" and "role=textbox[name=/uren" in selector and "contract" in selector:
+                action = {**action, "selector": "id=functieLoonGegevensPage:UrenPerWeekContractFieldInput"}
+
+            final_actions.append(action)
+
+        return final_actions
+
+    def _ensure_login_submit(self, actions: List[Dict]) -> List[Dict]:
+        """Insert login submit when codegen missed the submit trigger.
+
+        Some JSF/login pages navigate after credentials without recording the
+        actual click/Enter submit event. If we see username+password fills and
+        post-login actions, add a synthetic login_submit right after password.
+        """
+        username_index = -1
+        password_index = -1
+        has_submit = False
+
+        for i, action in enumerate(actions):
+            action_type = action.get("type")
+            selector = (action.get("selector") or "").lower()
+
+            if action_type == "login_submit":
+                has_submit = True
+
+            if action_type == "click" and (
+                re.search(r'type\s*=\s*["\']?submit\b', selector)
+                or re.search(r'name\s*=\s*["\']?login\b', selector)
+                or "j_spring_security_check" in selector
+            ):
+                has_submit = True
+
+            if action_type == "fill" and re.search(r'name\s*=\s*["\']?(username|user)\b', selector):
+                username_index = i
+            if action_type == "fill" and (
+                re.search(r'name\s*=\s*["\']?password\b', selector)
+                or re.search(r'type\s*=\s*["\']?password\b', selector)
+            ):
+                password_index = i
+
+        if has_submit or username_index == -1 or password_index == -1:
+            return actions
+
+        post_login_markers = (
+            "mainmenuform:",
+            "mainmenuform\\:",
+            "functiealgemeenpage:",
+            "functiealgemeenpage\\:",
+            "adareportpage:",
+            "adareportpage\\:",
+        )
+        has_post_login_actions = False
+        for action in actions[password_index + 1:]:
+            selector = (action.get("selector") or "").lower()
+            url = (action.get("url") or "").lower()
+            if any(marker in selector for marker in post_login_markers):
+                has_post_login_actions = True
+                break
+            if action.get("type") in {"go_to", "goto"} and "/ada/" in url:
+                has_post_login_actions = True
+                break
+
+        if not has_post_login_actions:
+            return actions
+
+        insert_at = password_index + 1
+        return actions[:insert_at] + [{"type": "login_submit"}] + actions[insert_at:]
 
     def _deduplicate_fills(self, actions: List[Dict]) -> List[Dict]:
         """Remove redundant fill actions and navigational Tab presses between fills."""
@@ -306,7 +456,9 @@ class PlaywrightToRobotConverter:
             return value.replace('"', r'\"')
 
         def _escape_regex(value: str) -> str:
-            return value.replace("/", r"\/")
+            # Escape all regex metacharacters (e.g. parentheses) because selector
+            # names are intended to match the literal accessible name text.
+            return re.escape(value).replace("/", r"\/")
 
         def _format_has_text(expression: Optional[str]) -> Optional[str]:
             if expression is None:
@@ -363,7 +515,7 @@ class PlaywrightToRobotConverter:
             ),
             (
                 re.compile(
-                    r'get_by_role\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']([^\)]*)\)'
+                    r'get_by_role\(["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\'](.*?)\)(?=\.|$)'
                 ),
                 lambda s, extra='': [_format_role_step(s, extra)],
             ),
@@ -583,6 +735,11 @@ class PlaywrightToRobotConverter:
         if ">>" in selector:
             return selector
 
+        # Keep attribute selectors with JSF-style names (containing ':') intact.
+        # Stripping quotes from these values can produce invalid CSS selectors.
+        if ":" in selector and ("[name=" in selector or "[id=" in selector):
+            return selector
+
         match = re.match(r'''^\[([a-zA-Z-]+)=['"]([^'"]+)['"]\]$''', selector)
         if match:
             attr, value = match.groups()
@@ -595,12 +752,22 @@ class PlaywrightToRobotConverter:
 
         selector = re.sub(r'\[([a-zA-Z-]+)=["\']([^"\']+)["\']\]', r"[\1=\2]", selector)
 
+        # Robot can treat a bare argument that starts with '#' as a comment token.
+        # For simple id selectors, use Playwright's id= engine to avoid CSS escaping issues.
+        if selector.startswith("#"):
+            m = re.fullmatch(r"#([^\s>+~\[]+)", selector)
+            if m:
+                selector = f"id={m.group(1).replace('\\:', ':')}"
+            else:
+                selector = f"css={selector}"
+
         return selector
 
     def _convert_goto(self, action: Dict) -> str:
         """Convert goto action to Robot Framework."""
         url = action.get("url", "")
-        return f"New Page{self.indent}{url}"
+        wait_line = f"Wait For Load State{self.indent}networkidle{self.indent}timeout=30s"
+        return f"New Page{self.indent}{url}\n{wait_line}"
 
     def _convert_go_to(self, action: Dict) -> str:
         """Convert in-context navigation to Robot Framework (Go To, not New Page)."""
@@ -618,6 +785,8 @@ class PlaywrightToRobotConverter:
         """Convert fill action to Robot Framework."""
         selector = self._simplify_selector(action.get("selector", ""))
         value = action.get("value", "")
+        if value == "":
+            return f"Clear Text{self.indent}{selector}"
         keyword = "Type Text" if self._is_live_search_fill(selector) else "Fill Text"
         return f"{keyword}{self.indent}{selector}{self.indent}{value}"
 
@@ -666,6 +835,8 @@ class PlaywrightToRobotConverter:
     def _convert_har_fill(self, action: Dict) -> str:
         selector = self._simplify_selector(action.get("selector", ""))
         value = action.get("value", "")
+        if value == "":
+            return f"Clear Text{self.indent}{selector}"
         return f"Fill Text{self.indent}{selector}{self.indent}{value}"
 
     def _convert_har_check(self, action: Dict) -> str:
@@ -678,7 +849,7 @@ class PlaywrightToRobotConverter:
         return f"Click{self.indent}{selector}"
 
     def _convert_har_hover(self, action: Dict) -> str:
-        selector = action.get("selector", "")
+        selector = self._simplify_selector(action.get("selector", ""))
         return f"Hover{self.indent}{selector}"
 
     def _convert_har_wait_load_state(self, action: Dict) -> str:
@@ -706,6 +877,11 @@ class PlaywrightToRobotConverter:
         This is a pragmatic fallback for JSF flows where UI interactions are visible
         in network POST data but are absent from recorded Playwright actions.
         """
+        # Keep HAR augmentation opt-in so default output reflects what recorder
+        # actually captured (useful when validating recorder fixes).
+        if not self._env_truthy("RFBROWSER_ENABLE_HAR_AUGMENT"):
+            return actions
+
         if not har_path or not os.path.exists(har_path):
             return actions
 
