@@ -844,8 +844,17 @@ class RecordActionTool implements RecorderTool {
   }
 
   private _consumedDueWrongTarget(event: Event): boolean {
-    if (this._activeModel && this._activeModel.elements[0] === this._recorder.deepEventTarget(event))
+    const eventTarget = this._recorder.deepEventTarget(event);
+    if (this._activeModel && this._activeModel.elements[0] === eventTarget)
       return false;
+    // JSF/AJAX apps (e.g. RichFaces) re-render DOM nodes during partial updates,
+    // detaching the element that _activeModel holds. When that happens, regenerate
+    // _activeModel from the currently focused element so input events aren't lost.
+    if (this._activeModel && !this._recorder.document.contains(this._activeModel.elements[0])) {
+      this._onFocus(false);
+      if (this._activeModel && this._activeModel.elements[0] === eventTarget)
+        return false;
+    }
     consumeEvent(event);
     return true;
   }

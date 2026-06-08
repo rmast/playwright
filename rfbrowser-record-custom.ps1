@@ -27,6 +27,14 @@ foreach ($target in $recorderTargets) {
 }
 
 # Keep recorder runtimes in sync with local generated Playwright sources.
+# If recorder.ts was modified more recently than the compiled output, rebuild first.
+$recorderTs = Resolve-Path ".\packages\injected\src\recorder\recorder.ts"
+$compiledJs  = ".\packages\playwright-core\lib\generated\pollingRecorderSource.js"
+if ((Test-Path $compiledJs) -and ((Get-Item $recorderTs).LastWriteTime -gt (Get-Item $compiledJs).LastWriteTime)) {
+	Write-Host "recorder.ts is newer than compiled output — rebuilding..."
+	node utils/build/build.js
+}
+
 $generatedFiles = @(
 	"injectedScriptSource.js",
 	"pollingRecorderSource.js"

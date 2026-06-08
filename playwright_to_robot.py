@@ -26,6 +26,7 @@ class PlaywrightToRobotConverter:
             "har_fill": self._convert_har_fill,
             "har_check": self._convert_har_check,
             "har_click": self._convert_har_click,
+            "har_hover": self._convert_har_hover,
             "har_wait_load_state": self._convert_har_wait_load_state,
             "har_wait_elements_state": self._convert_har_wait_elements_state,
             "select_option": self._convert_select_option,
@@ -227,6 +228,25 @@ class PlaywrightToRobotConverter:
         i = 0
         while i < len(actions):
             a = actions[i]
+
+            # Drop bare `click role=group` — too ambiguous and only a focus artifact
+            if (
+                a.get("type") == "click"
+                and a.get("selector", "").lower() == "role=group"
+            ):
+                i += 1
+                continue
+
+            # Drop `click X` immediately followed by `fill X` on the same selector
+            if (
+                a.get("type") == "click"
+                and i + 1 < len(actions)
+                and actions[i + 1].get("type") == "fill"
+                and actions[i + 1].get("selector") == a.get("selector")
+            ):
+                i += 1
+                continue
+
             if a.get("type") == "fill":
                 # Look ahead: skip Dead-key presses and collect subsequent fills on same selector
                 j = i + 1
@@ -657,6 +677,10 @@ class PlaywrightToRobotConverter:
         selector = self._make_click_selector_strict_safe(selector)
         return f"Click{self.indent}{selector}"
 
+    def _convert_har_hover(self, action: Dict) -> str:
+        selector = action.get("selector", "")
+        return f"Hover{self.indent}{selector}"
+
     def _convert_har_wait_load_state(self, action: Dict) -> str:
         state = action.get("state", "networkidle")
         timeout = action.get("timeout", "30s")
@@ -718,7 +742,7 @@ class PlaywrightToRobotConverter:
                 clicked_create_button = True
 
         if not latest_sbc_code:
-            return actions
+            return self._augment_functie_algemeen_from_har(actions, entries)
 
         has_sbc_in_actions = any(
             a.get("type") == "fill" and str(a.get("value", "")).strip() == latest_sbc_code
@@ -830,7 +854,98 @@ class PlaywrightToRobotConverter:
 
         nav_prefix = [ada_nav] if ada_nav else []
 
-        return before + nav_prefix + form_steps + start_dw + click_step + finish_dw
+        actions = before + nav_prefix + form_steps + start_dw + click_step + finish_dw
+        return self._augment_functie_algemeen_from_har(actions, entries)
+
+    def _augment_functie_algemeen_from_har(
+        self, actions: List[Dict], entries: List[Dict]
+    ) -> List[Dict]:
+        """Inject functieAlgemeenPage fields from HAR when recorder missed them.
+
+        The recorder skips the Algemeen tab because HAR-routing served a cached
+        response for the direct goto, bypassing the menu flow entirely.
+        """
+        # Find the last complete POST to functie/algemeen that contains nextButton
+        algemeen_params: Optional[Dict[str, str]] = None
+        for entry in entries:
+            req = entry.get("request", {})
+            if "functie/algemeen" not in req.get("url", ""):
+                continue
+            if req.get("method") != "POST":
+                continue
+            text = req.get("postData", {}).get("text", "")
+            if not text:
+                continue
+            params = {k: v[-1] for k, v in parse_qs(text, keep_blank_values=True).items()}
+            if "functieAlgemeenPage:nextButton" in params:
+                algemeen_params = params
+
+        if not algemeen_params:
+            return actions
+
+        # Fields we want to inject (skip hidden/system/leeftijd defaults)
+        _SKIP = {
+            "functieAlgemeenPage",
+            "indicatieVervallenInEindselectie",
+            "arbeidspatroonId", "functieNummerId", "vraagAntwoordId",
+            "functieselectieId", "selectieFunctieBestandAsLong",
+            "functienaam", "autoScroll",
+            "functieAlgemeenPage:nextButton",
+            "functieAlgemeenPage:LeeftijdFieldInput",
+            "functieAlgemeenPage:LeeftijdFieldInput1",
+        }
+        _FILL_FIELDS = [
+            "functieAlgemeenPage:functienummerFieldInput",
+            "functieAlgemeenPage:functienummerFieldInput1",
+            "functieAlgemeenPage:FunctienaamFieldInput",
+            "functieAlgemeenPage:ArbeidsplaatsenFieldInput",
+            "functieAlgemeenPage:sbcCodeFieldInput",
+        ]
+
+        # Check if actions already contain any functieAlgemeenPage fills
+        has_algemeen = any(
+            a.get("selector", "").startswith("[name='functieAlgemeenPage:")
+            for a in actions
+        )
+        if has_algemeen:
+            return actions
+
+        # Check if there is a go_to or goto targeting functie/algemeen
+        algemeen_idx = next(
+            (
+                i for i, a in enumerate(actions)
+                if a.get("type") in ("go_to", "goto")
+                and "functie/algemeen" in a.get("url", "")
+            ),
+            None,
+        )
+        if algemeen_idx is None:
+            return actions
+
+        # Build the replacement: menu nav + fills + nextButton click + wait
+        nav_url = actions[algemeen_idx].get("url", "")
+        # Keep the base URL for Go To (needed so JSF session is in functie context)
+        # But actually we replace the direct goto with menu navigation
+        injected: List[Dict] = [
+            {"type": "har_hover", "selector": "id=mainmenuform:mainmenu_functie"},
+            {"type": "har_click", "selector": "id=mainmenuform:mainmenu_functie_nieuw"},
+            {"type": "har_wait_load_state", "state": "networkidle", "timeout": "30s"},
+            {"type": "har_comment", "text": "HAR inferred missing UI steps: functieAlgemeenPage"},
+        ]
+        for field in _FILL_FIELDS:
+            val = algemeen_params.get(field, "").strip()
+            if val:
+                injected.append({
+                    "type": "har_fill",
+                    "selector": f"[name='{field}']",
+                    "value": val,
+                })
+        injected += [
+            {"type": "har_click", "selector": "[name='functieAlgemeenPage:nextButton']"},
+            {"type": "har_wait_load_state", "state": "networkidle", "timeout": "30s"},
+        ]
+
+        return actions[:algemeen_idx] + injected + actions[algemeen_idx + 1:]
 
     def _convert_select_option(self, action: Dict) -> str:
         """Convert select_option to Robot Framework."""
