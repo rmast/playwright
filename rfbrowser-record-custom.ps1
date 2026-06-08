@@ -27,12 +27,26 @@ foreach ($target in $recorderTargets) {
 }
 
 # Keep recorder runtimes in sync with local generated Playwright sources.
-# If recorder.ts was modified more recently than the compiled output, rebuild first.
+# If recorder.ts was modified more recently than the compiled output, do a fast
+# recorder-only refresh instead of a full monorepo build.
 $recorderTs = Resolve-Path ".\packages\injected\src\recorder\recorder.ts"
 $compiledJs  = ".\packages\playwright-core\lib\generated\pollingRecorderSource.js"
 if ((Test-Path $compiledJs) -and ((Get-Item $recorderTs).LastWriteTime -gt (Get-Item $compiledJs).LastWriteTime)) {
-	Write-Host "recorder.ts is newer than compiled output — rebuilding..."
-	node utils/build/build.js
+	Write-Host "recorder.ts is newer than compiled output — running fast recorder refresh..."
+	try {
+		# 1) Re-bundle injected scripts and regenerate source *.ts payloads.
+		node utils/generate_injected.js
+		if ($LASTEXITCODE -ne 0) { throw "utils/generate_injected.js failed" }
+
+		# 2) Transpile generated sources to playwright-core lib output used at runtime.
+		npx esbuild packages/playwright-core/src/generated/*.ts --outdir=packages/playwright-core/lib/generated --platform=node --format=cjs
+		if ($LASTEXITCODE -ne 0) { throw "esbuild transpile for playwright-core generated sources failed" }
+	}
+	catch {
+		Write-Warning "Fast recorder refresh failed ($($_.Exception.Message)). Falling back to full build..."
+		node utils/build/build.js
+		if ($LASTEXITCODE -ne 0) { throw "Full build failed" }
+	}
 }
 
 $generatedFiles = @(

@@ -58,9 +58,11 @@ interface RecorderTool {
   onPointerUp?(event: PointerEvent): void;
   onMouseDown?(event: MouseEvent): void;
   onMouseUp?(event: MouseEvent): void;
+  onMouseMove?(event: MouseEvent): void;
   onMouseEnter?(event: MouseEvent): void;
   onMouseLeave?(event: MouseEvent): void;
   onFocus?(event: Event): void;
+  onScroll?(event: Event): void;
 }
 
 class NoneTool implements RecorderTool {
@@ -251,9 +253,11 @@ class RecordActionTool implements RecorderTool {
     if (this._shouldIgnoreMouseEvent(event))
       return;
 
+    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+
     // Keep native navigation semantics for menu/navigation clicks.
     // Record the click, but do not consume/replay it.
-    if (event.type === 'click' && event.button === 0 && event.detail === 1) {
+    if (!checkboxTarget && event.type === 'click' && event.button === 0 && event.detail === 1) {
       const passthroughTarget = this._nativePassthroughTargetFromEvent(event);
       if (passthroughTarget) {
         const model = this._bestEffortModelForClick(event, passthroughTarget);
@@ -275,7 +279,7 @@ class RecordActionTool implements RecorderTool {
 
     // JSF-style submits should keep native browser navigation semantics.
     // Record the click, but do not consume the event or replay it.
-    if (event.type === 'click' && event.button === 0 && event.detail === 1 && this._eventHasJsfSubmitTarget(event)) {
+    if (!checkboxTarget && event.type === 'click' && event.button === 0 && event.detail === 1 && this._eventHasJsfSubmitTarget(event)) {
       const jsfTarget = this._jsfSubmitElementFromEvent(event);
       if (!jsfTarget)
         return;
@@ -296,7 +300,7 @@ class RecordActionTool implements RecorderTool {
 
     if (this._actionInProgress(event))
       return;
-    const model = this._modelForMouseEvent(event);
+    const model = checkboxTarget ? (this._modelForTarget(checkboxTarget) || this._modelForMouseEvent(event)) : this._modelForMouseEvent(event);
     if (this._consumedDueToNoModel(event, model))
       return;
 
@@ -305,11 +309,10 @@ class RecordActionTool implements RecorderTool {
       return;
     }
 
-    const checkbox = asCheckbox(this._recorder.deepEventTarget(event));
-    if (checkbox && event.detail === 1) {
+    if (checkboxTarget && event.detail === 1) {
       // Interestingly, inputElement.checked is reversed inside this event handler.
       this._performAction({
-        name: checkbox.checked ? 'check' : 'uncheck',
+        name: checkboxTarget.checked ? 'check' : 'uncheck',
         selector: model!.selector,
         signals: [],
       });
@@ -395,7 +398,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
-    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+    if (!checkboxTarget && event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
   }
@@ -405,7 +409,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
-    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+    if (!checkboxTarget && event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
   }
@@ -415,7 +420,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
-    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+    if (!checkboxTarget && event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
     this._activeModel = this._hoveredModel;
@@ -426,7 +432,8 @@ class RecordActionTool implements RecorderTool {
       return;
     if (this._shouldIgnoreMouseEvent(event))
       return;
-    if (event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
+    const checkboxTarget = checkboxForTarget(this._recorder.deepEventTarget(event));
+    if (!checkboxTarget && event.button === 0 && (this._eventHasJsfSubmitTarget(event) || !!this._nativePassthroughTargetFromEvent(event)))
       return;
     this._consumeWhenAboutToPerform(event);
   }
@@ -907,6 +914,10 @@ class RecordActionTool implements RecorderTool {
     if (typeof event.key !== 'string')
       return false;
 
+    // Keep native focus navigation in forms.
+    if (event.key === 'Tab')
+      return false;
+
     // Enter aka. new line is handled in input event.
     if (event.key === 'Enter' && (this._recorder.deepEventTarget(event).nodeName === 'TEXTAREA' || this._recorder.deepEventTarget(event).isContentEditable))
       return false;
@@ -1120,6 +1131,10 @@ class JsonRecordActionTool implements RecorderTool {
   private _shouldGenerateKeyPressFor(event: KeyboardEvent): boolean {
     // IME can generate keyboard events that don't provide a value for the key property (e.g. chrome autofill)
     if (typeof event.key !== 'string')
+      return false;
+
+    // Keep native focus navigation in forms.
+    if (event.key === 'Tab')
       return false;
 
     // Enter aka. new line is handled in input event.
@@ -2094,6 +2109,31 @@ function asCheckbox(node: Node | null): HTMLInputElement | null {
     return null;
   const inputElement = node as HTMLInputElement;
   return ['checkbox', 'radio'].includes(inputElement.type) ? inputElement : null;
+}
+
+function checkboxForTarget(target: HTMLElement | null): HTMLInputElement | null {
+  const directCheckbox = asCheckbox(target);
+  if (directCheckbox)
+    return directCheckbox;
+
+  const nestedDirect = target?.querySelector('input[type="checkbox"], input[type="radio"]') || null;
+  const nestedDirectCheckbox = asCheckbox(nestedDirect);
+  if (nestedDirectCheckbox)
+    return nestedDirectCheckbox;
+
+  const closestLabel = target?.closest('label') as HTMLLabelElement | null;
+  if (!closestLabel)
+    return null;
+
+  if (closestLabel.htmlFor) {
+    const byFor = closestLabel.ownerDocument.getElementById(closestLabel.htmlFor);
+    const checkbox = asCheckbox(byFor);
+    if (checkbox)
+      return checkbox;
+  }
+
+  const nested = closestLabel.querySelector('input[type="checkbox"], input[type="radio"]');
+  return asCheckbox(nested);
 }
 
 function readableOptionValue(option: HTMLOptionElement): string {
